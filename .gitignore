@@ -1,0 +1,29 @@
+# 本地数据和运行结果
+data/
+output/
+logs/
+*.log
+
+# Python/测试缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+
+# IDE / 本地工具配置
+.idea/
+.vscode/
+.claude/
+.superpowers/
+
+# 实验输出
+experiments/**/output/
+
+# 临时文件
+loc_stats.txt
+utils/tmp*.txt
+
+# 构建产物
+build/
+dist/
+*.spec
