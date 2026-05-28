@@ -15,6 +15,7 @@ __pycache__/
 .vscode/
 .claude/
 .superpowers/
+.worktrees/
 
 # 实验输出
 experiments/**/output/
