@@ -9,6 +9,7 @@ from typing import Any, Iterable, Sequence
 from core.batch_processor import BatchAnalysisReport, BatchSampleResult
 from core.grouping import PlantImageGroup
 from core.pipeline import PlantAnalysisResult, TRAIT_SPECS
+from core.traits import compute_front_view_traits
 
 VIEW_SEQUENCE: tuple[str, ...] = ("TOP", "FRONT-1", "FRONT-2")
 
@@ -114,14 +115,78 @@ def _build_view_record(
     for trait in result.traits:
         if view_name not in trait.source_views:
             continue
+        value = _view_trait_value(result, view_name, trait.key, trait.value)
         if include_debug_fields:
-            record[f"{trait.key}_value"] = trait.value
+            record[f"{trait.key}_value"] = value
             record[f"{trait.key}_unit"] = trait.unit
             record[f"{trait.key}_status"] = trait.status
             record[f"{trait.key}_message"] = trait.message
         else:
-            record[trait.key] = trait.value
+            record[trait.key] = value
     return record
+
+
+def _view_trait_value(result: PlantAnalysisResult, view_name: str, trait_key: str, fallback_value: Any) -> Any:
+    """Return a view-specific trait value when the export row represents one FRONT view."""
+
+    if view_name not in {"FRONT-1", "FRONT-2"}:
+        return fallback_value
+    if trait_key == "canopy_height":
+        return _front_view_length_value(result, view_name, "canopy_height_pixels", fallback_value)
+    if trait_key == "side_projection_area":
+        return _front_view_area_value(result, view_name, "projection_area_pixels", fallback_value)
+    return fallback_value
+
+
+def _front_view_length_value(
+    result: PlantAnalysisResult,
+    view_name: str,
+    measurement_name: str,
+    fallback_value: Any,
+) -> Any:
+    """Return one FRONT length measurement converted with that view's calibration when possible."""
+
+    measurements = _front_view_measurements(result, view_name)
+    if measurements is None:
+        return fallback_value
+
+    raw_value = getattr(measurements, measurement_name)
+    calibration = result.calibration_results.get(view_name)
+    if bool(getattr(calibration, "is_calibrated", False)):
+        from core.calibration import pixels_to_cm
+
+        return round(pixels_to_cm(raw_value, calibration.mm_per_pixel), 2)
+    return raw_value
+
+
+def _front_view_area_value(
+    result: PlantAnalysisResult,
+    view_name: str,
+    measurement_name: str,
+    fallback_value: Any,
+) -> Any:
+    """Return one FRONT area measurement converted with that view's calibration when possible."""
+
+    measurements = _front_view_measurements(result, view_name)
+    if measurements is None:
+        return fallback_value
+
+    raw_value = getattr(measurements, measurement_name)
+    calibration = result.calibration_results.get(view_name)
+    if bool(getattr(calibration, "is_calibrated", False)):
+        from core.calibration import pixel_area_to_cm2
+
+        return round(pixel_area_to_cm2(raw_value, calibration.mm_per_pixel), 2)
+    return raw_value
+
+
+def _front_view_measurements(result: PlantAnalysisResult, view_name: str) -> Any | None:
+    """Compute measurements for one FRONT segmentation, if available."""
+
+    segmentation = result.front_segmentations.get(view_name)
+    if segmentation is None:
+        return None
+    return compute_front_view_traits(segmentation)
 
 
 def build_batch_records(report: BatchAnalysisReport, *, include_debug_fields: bool = False) -> list[dict[str, Any]]:

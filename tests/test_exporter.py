@@ -74,10 +74,11 @@ def test_build_view_records_outputs_one_row_per_view() -> None:
     assert records[0]["leaf_area"] == 12.34
     assert records[0]["flower_count"] == 3
     assert "canopy_height" not in records[0]
-    assert records[1]["canopy_height"] == 7.89
-    assert records[1]["side_projection_area"] == 9.87
+    assert records[1]["canopy_height"] == 4.0
+    assert records[1]["side_projection_area"] == 2.0
     assert "flower_count" not in records[1]
-    assert records[2]["canopy_height"] == 7.89
+    assert records[2]["canopy_height"] == 6.0
+    assert records[2]["side_projection_area"] == 4.0
 
 
 def test_export_single_result_writes_csv(tmp_path: Path) -> None:
@@ -161,9 +162,13 @@ def _build_result() -> PlantAnalysisResult:
             "FRONT-2": SimpleNamespace(status="loaded"),
         },
         calibration_results={
-            "TOP": SimpleNamespace(status="calibrated", mm_per_pixel=0.2),
-            "FRONT-1": SimpleNamespace(status="calibrated", mm_per_pixel=0.2),
-            "FRONT-2": SimpleNamespace(status="calibrated", mm_per_pixel=0.2),
+            "TOP": SimpleNamespace(status="calibrated", mm_per_pixel=0.2, is_calibrated=True),
+            "FRONT-1": SimpleNamespace(status="calibrated", mm_per_pixel=0.2, is_calibrated=True),
+            "FRONT-2": SimpleNamespace(status="calibrated", mm_per_pixel=0.2, is_calibrated=True),
+        },
+        front_segmentations={
+            "FRONT-1": SimpleNamespace(bounding_box=(0, 0, 10, 200), mask_area_pixels=5000),
+            "FRONT-2": SimpleNamespace(bounding_box=(0, 0, 20, 300), mask_area_pixels=10000),
         },
         errors=[],
     )

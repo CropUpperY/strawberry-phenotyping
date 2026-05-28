@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
 from config.settings import DEFAULT_CONFIG
 from core.image_io import load_image
 from core.batch_processor import BatchAnalysisReport, analyze_groups
-from core.calibration import create_color_card_reference
+from core.calibration import create_color_card_reference, pixel_area_to_cm2, pixels_to_cm
 from core.grouping import (
     GroupingSuggestion,
     PlantImageGroup,
@@ -50,6 +50,7 @@ from core.grouping import (
     group_image_files,
 )
 from core.pipeline import PlantAnalysisResult, TRAIT_SPECS, analyze_plant_group, format_status_label
+from core.traits import compute_front_view_traits
 from core.visualization import AnalysisDebugPreviews, build_analysis_debug_previews
 from gui.color_card_selector import (
     ColorCardRegions,
@@ -677,6 +678,7 @@ class StrawberryMainWindow(QMainWindow):
         self.batch_preview_sample_ids: list[str] = []
         self.batch_preview_index = 0
         self._active_trait_key: str | None = None
+        self._displayed_trait_keys: list[str] = [spec.key for spec in TRAIT_SPECS]
 
         self.setWindowIcon(self._load_app_icon())
 
@@ -1229,24 +1231,77 @@ class StrawberryMainWindow(QMainWindow):
         )
 
     def _set_result_rows(self, result: PlantAnalysisResult | None = None) -> None:
+        active_view = self.preview_view_state.view_name
+        specs = self._trait_specs_for_view(active_view)
+        self._displayed_trait_keys = [spec.key for spec in specs]
+        self.results_table.setRowCount(len(specs))
+
         if result is None:
-            rows = [(spec.label, "--") for spec in TRAIT_SPECS]
+            rows = [(spec.label, "--") for spec in specs]
         else:
-            rows = [(trait.label, self._format_trait_result_value(trait)) for trait in result.traits]
+            trait_map = result.trait_map()
+            rows = [
+                (
+                    spec.label,
+                    self._format_trait_value(
+                        value=self._trait_value_for_view(result, active_view, spec.key),
+                        unit=trait_map[spec.key].unit if spec.key in trait_map else spec.unit,
+                    ),
+                )
+                for spec in specs
+            ]
 
         for row_index, row_values in enumerate(rows):
             for column_index, value in enumerate(row_values):
                 self.results_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
 
+    def _trait_specs_for_view(self, view_name: str) -> list[Any]:
+        """Return trait specs that should be shown for the active preview view."""
+
+        return [spec for spec in TRAIT_SPECS if view_name in spec.source_views]
+
+    def _trait_value_for_view(self, result: PlantAnalysisResult, view_name: str, trait_key: str) -> Any:
+        """Return the measurement value for the active view, using per-FRONT values when available."""
+
+        trait = result.trait_map().get(trait_key)
+        fallback_value = trait.value if trait is not None else None
+        if view_name not in {"FRONT-1", "FRONT-2"}:
+            return fallback_value
+
+        segmentation = result.front_segmentations.get(view_name)
+        if segmentation is None:
+            return fallback_value
+
+        measurements = compute_front_view_traits(segmentation)
+        calibration = result.calibration_results.get(view_name)
+        is_calibrated = bool(getattr(calibration, "is_calibrated", False))
+        if trait_key == "canopy_height":
+            raw_value = measurements.canopy_height_pixels
+            if is_calibrated:
+                return round(pixels_to_cm(raw_value, calibration.mm_per_pixel), 2)
+            return raw_value
+        if trait_key == "side_projection_area":
+            raw_value = measurements.projection_area_pixels
+            if is_calibrated:
+                return round(pixel_area_to_cm2(raw_value, calibration.mm_per_pixel), 2)
+            return raw_value
+        return fallback_value
+
     def _format_trait_result_value(self, trait: TraitResult) -> str:
         """Return a localized result string for measurement tables and focus cards."""
 
-        if trait.value is None:
+        return self._format_trait_value(value=trait.value, unit=trait.unit)
+
+    def _format_trait_value(self, *, value: Any, unit: str) -> str:
+        """Return a localized trait value string."""
+
+        if value is None:
             return "--"
-        unit = self._localized_trait_unit(trait.unit)
-        if not unit:
-            return trait.display_value
-        return f"{trait.display_value} {unit}"
+        display_value = f"{value:.2f}" if isinstance(value, float) else str(value)
+        unit_text = self._localized_trait_unit(unit)
+        if not unit_text:
+            return display_value
+        return f"{display_value} {unit_text}"
 
     def _localized_trait_unit(self, unit: str) -> str:
         """Convert internal units to labels that fit the Chinese UI."""
@@ -1258,17 +1313,20 @@ class StrawberryMainWindow(QMainWindow):
     def _on_trait_row_changed(self, current_row: int, _current_column: int, _previous_row: int, _previous_column: int) -> None:
         """Link the selected trait row to the center phenotype preview panel."""
 
-        if current_row < 0 or current_row >= len(TRAIT_SPECS):
+        if current_row < 0 or current_row >= len(self._displayed_trait_keys):
             return
         self._apply_trait_focus_by_row(current_row)
 
     def _apply_trait_focus_by_row(self, row_index: int) -> None:
         """Update trait summary and highlighted preview according to the selected row."""
 
-        if row_index < 0 or row_index >= len(TRAIT_SPECS):
+        if row_index < 0 or row_index >= len(self._displayed_trait_keys):
             return
 
-        spec = TRAIT_SPECS[row_index]
+        trait_key = self._displayed_trait_keys[row_index]
+        spec = next((item for item in TRAIT_SPECS if item.key == trait_key), None)
+        if spec is None:
+            return
         self._active_trait_key = spec.key
 
         if self.displayed_result is None:
@@ -1289,10 +1347,11 @@ class StrawberryMainWindow(QMainWindow):
         if trait is None:
             return
 
+        value = self._trait_value_for_view(self.displayed_result, self.preview_view_state.view_name, trait.key)
         self._update_trait_focus_panel(
             title=trait.label,
-            value_text=f"结果: {self._format_trait_result_value(trait)}",
-            source_views=trait.source_views,
+            value_text=f"结果: {self._format_trait_value(value=value, unit=trait.unit)}",
+            source_views=(self.preview_view_state.view_name,),
             status_text=f"状态: {format_status_label(trait.status)}",
             message=trait.message,
         )
@@ -2019,6 +2078,7 @@ class StrawberryMainWindow(QMainWindow):
         )
         self._refresh_preview_header()
         self._render_current_preview()
+        self._set_result_rows(self.displayed_result)
 
     def _render_current_preview(self) -> None:
         state = self.preview_view_state
@@ -2582,9 +2642,10 @@ class StrawberryMainWindow(QMainWindow):
         self._set_result_rows(result)
 
         target_row = self.results_table.currentRow()
-        if target_row < 0 or target_row >= len(TRAIT_SPECS):
+        if target_row < 0 or target_row >= len(self._displayed_trait_keys):
             target_row = 0
-        self.results_table.setCurrentCell(target_row, 0)
+        if self._displayed_trait_keys:
+            self.results_table.setCurrentCell(target_row, 0)
 
     def _sync_displayed_result_for_sample(self, sample_id: str) -> None:
         """Update the measurement table to match the sample shown in the center panel."""

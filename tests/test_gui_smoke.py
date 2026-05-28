@@ -42,7 +42,7 @@ def test_main_window_initializes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert window.windowTitle() == DEFAULT_CONFIG.app_name
     assert window.group_list is not None
-    assert window.results_table.rowCount() == len(TRAIT_SPECS)
+    assert window.results_table.rowCount() == len([spec for spec in TRAIT_SPECS if "TOP" in spec.source_views])
     assert window.results_table.columnCount() == 2
     assert window.card_width_spin.value() == 1.50
     assert window.card_height_spin.value() == 1.50
@@ -211,11 +211,94 @@ def test_result_table_uses_single_result_column_and_chinese_count_unit(monkeypat
     )
 
     window._set_result_rows(result)
-    flower_row = next(index for index, spec in enumerate(TRAIT_SPECS) if spec.key == "flower_count")
+    flower_label = next(spec.label for spec in TRAIT_SPECS if spec.key == "flower_count")
+    flower_row = next(
+        row for row in range(window.results_table.rowCount())
+        if window.results_table.item(row, 0).text() == flower_label
+    )
 
     assert window.results_table.horizontalHeaderItem(0).text() == "性状"
     assert window.results_table.horizontalHeaderItem(1).text() == "结果"
     assert window.results_table.item(flower_row, 1).text() == "2 个"
+    window.close()
+
+
+def test_result_table_tracks_active_preview_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switching the preview view should show measurements for that view only."""
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(StrawberryMainWindow, "_load_groups", lambda self, directory: None)
+    monkeypatch.setattr(StrawberryMainWindow, "_find_latest_sample_visualization_root", lambda self, sample_id: None)
+
+    window = StrawberryMainWindow()
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    result = PlantAnalysisResult(
+        sample_id="1AB",
+        status="analysis_complete",
+        message="done",
+        traits=[
+            TraitResult(
+                key=spec.key,
+                label=spec.label,
+                source_views=spec.source_views,
+                unit=spec.unit,
+                value={
+                    "leaf_area": 12.34,
+                    "greenness": 45.67,
+                    "convex_hull_area": 14.56,
+                    "canopy_width": 8.9,
+                    "flower_count": 2,
+                    "flower_bud_count": 4,
+                    "fruit_count": 0,
+                    "canopy_height": 7.89,
+                    "side_projection_area": 9.87,
+                }.get(spec.key),
+                status="computed",
+            )
+            for spec in TRAIT_SPECS
+        ],
+        view_results={
+            "TOP": ViewLoadResult("TOP", None, "loaded"),
+            "FRONT-1": ViewLoadResult("FRONT-1", None, "loaded"),
+            "FRONT-2": ViewLoadResult("FRONT-2", None, "loaded"),
+        },
+        calibration_results={
+            "FRONT-1": SimpleNamespace(status="calibrated", mm_per_pixel=0.2, is_calibrated=True),
+            "FRONT-2": SimpleNamespace(status="calibrated", mm_per_pixel=0.2, is_calibrated=True),
+        },
+        front_segmentations={
+            "FRONT-1": SimpleNamespace(bounding_box=(0, 0, 10, 200), mask_area_pixels=5000),
+            "FRONT-2": SimpleNamespace(bounding_box=(0, 0, 20, 300), mask_area_pixels=10000),
+        },
+    )
+
+    window.groups = [group]
+    window.current_result = result
+    window._show_trait_preview_for_sample("1AB")
+
+    top_labels = [window.results_table.item(row, 0).text() for row in range(window.results_table.rowCount())]
+    top_values = [window.results_table.item(row, 1).text() for row in range(window.results_table.rowCount())]
+    assert result.trait_map()["canopy_height"].label not in top_labels
+    assert "12.34 cm^2" in top_values
+    assert any(value.startswith("2 ") for value in top_values)
+
+    window._show_next_preview_view()
+    front_1_labels = [window.results_table.item(row, 0).text() for row in range(window.results_table.rowCount())]
+    front_1_values = [window.results_table.item(row, 1).text() for row in range(window.results_table.rowCount())]
+    assert front_1_labels == [
+        result.trait_map()["canopy_height"].label,
+        result.trait_map()["side_projection_area"].label,
+    ]
+    assert front_1_values == ["4.00 cm", "2.00 cm^2"]
+
+    window._show_next_preview_view()
+    front_2_values = [window.results_table.item(row, 1).text() for row in range(window.results_table.rowCount())]
+    assert front_2_values == ["6.00 cm", "4.00 cm^2"]
     window.close()
 
 
