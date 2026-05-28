@@ -1084,8 +1084,8 @@ class StrawberryMainWindow(QMainWindow):
         results_group = QGroupBox("表型测量结果")
         results_layout = QVBoxLayout(results_group)
         results_layout.setContentsMargins(6, 12, 6, 6)
-        self.results_table = QTableWidget(len(TRAIT_SPECS), 3)
-        self.results_table.setHorizontalHeaderLabels(["性状", "数值", "单位"])
+        self.results_table = QTableWidget(len(TRAIT_SPECS), 2)
+        self.results_table.setHorizontalHeaderLabels(["性状", "结果"])
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1230,13 +1230,30 @@ class StrawberryMainWindow(QMainWindow):
 
     def _set_result_rows(self, result: PlantAnalysisResult | None = None) -> None:
         if result is None:
-            rows = [(spec.label, "--", spec.unit) for spec in TRAIT_SPECS]
+            rows = [(spec.label, "--") for spec in TRAIT_SPECS]
         else:
-            rows = [(trait.label, trait.display_value, trait.unit) for trait in result.traits]
+            rows = [(trait.label, self._format_trait_result_value(trait)) for trait in result.traits]
 
         for row_index, row_values in enumerate(rows):
             for column_index, value in enumerate(row_values):
                 self.results_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
+
+    def _format_trait_result_value(self, trait: TraitResult) -> str:
+        """Return a localized result string for measurement tables and focus cards."""
+
+        if trait.value is None:
+            return "--"
+        unit = self._localized_trait_unit(trait.unit)
+        if not unit:
+            return trait.display_value
+        return f"{trait.display_value} {unit}"
+
+    def _localized_trait_unit(self, unit: str) -> str:
+        """Convert internal units to labels that fit the Chinese UI."""
+
+        return {
+            "count": "个",
+        }.get(unit, unit)
 
     def _on_trait_row_changed(self, current_row: int, _current_column: int, _previous_row: int, _previous_column: int) -> None:
         """Link the selected trait row to the center phenotype preview panel."""
@@ -1255,9 +1272,11 @@ class StrawberryMainWindow(QMainWindow):
         self._active_trait_key = spec.key
 
         if self.displayed_result is None:
+            unit_text = self._localized_trait_unit(spec.unit)
+            value_text = f"结果: -- {unit_text}" if unit_text else "结果: --"
             self._update_trait_focus_panel(
                 title=spec.label,
-                value_text=f"数值: -- {spec.unit}",
+                value_text=value_text,
                 source_views=spec.source_views,
                 status_text="状态: --",
                 message="尚未得到该性状的分析结果。",
@@ -1272,7 +1291,7 @@ class StrawberryMainWindow(QMainWindow):
 
         self._update_trait_focus_panel(
             title=trait.label,
-            value_text=f"数值: {trait.display_value} {trait.unit}",
+            value_text=f"结果: {self._format_trait_result_value(trait)}",
             source_views=trait.source_views,
             status_text=f"状态: {format_status_label(trait.status)}",
             message=trait.message,

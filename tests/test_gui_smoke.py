@@ -43,7 +43,7 @@ def test_main_window_initializes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert window.windowTitle() == DEFAULT_CONFIG.app_name
     assert window.group_list is not None
     assert window.results_table.rowCount() == len(TRAIT_SPECS)
-    assert window.results_table.columnCount() == 3
+    assert window.results_table.columnCount() == 2
     assert window.card_width_spin.value() == 1.50
     assert window.card_height_spin.value() == 1.50
     assert window.preview_view_prev_button.text() == "‹"
@@ -175,9 +175,47 @@ def test_trait_table_selection_updates_center_trait_focus(monkeypatch: pytest.Mo
     window._set_displayed_result(result)
 
     assert "叶面积" in window.trait_focus_title.text()
-    assert "12.34" in window.trait_focus_value.text()
+    assert "12.34 cm^2" in window.trait_focus_value.text()
     assert "已计算" in window.trait_focus_status.text()
     assert "leaf area ok" in window.trait_focus_message.text()
+    window.close()
+
+
+def test_result_table_uses_single_result_column_and_chinese_count_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measurement results should combine value and unit in one localized result column."""
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(StrawberryMainWindow, "_load_groups", lambda self, directory: None)
+
+    window = StrawberryMainWindow()
+    result = PlantAnalysisResult(
+        sample_id="1AB",
+        status="analysis_complete",
+        message="done",
+        traits=[
+            TraitResult(
+                key=spec.key,
+                label=spec.label,
+                source_views=spec.source_views,
+                unit=spec.unit,
+                value=2 if spec.key == "flower_count" else None,
+                status="computed" if spec.key == "flower_count" else "pending",
+            )
+            for spec in TRAIT_SPECS
+        ],
+        view_results={
+            "TOP": ViewLoadResult("TOP", None, "loaded"),
+            "FRONT-1": ViewLoadResult("FRONT-1", None, "loaded"),
+            "FRONT-2": ViewLoadResult("FRONT-2", None, "loaded"),
+        },
+    )
+
+    window._set_result_rows(result)
+    flower_row = next(index for index, spec in enumerate(TRAIT_SPECS) if spec.key == "flower_count")
+
+    assert window.results_table.horizontalHeaderItem(0).text() == "性状"
+    assert window.results_table.horizontalHeaderItem(1).text() == "结果"
+    assert window.results_table.item(flower_row, 1).text() == "2 个"
     window.close()
 
 
@@ -226,10 +264,10 @@ def test_batch_preview_switch_updates_measurement_table(monkeypatch: pytest.Monk
 
     window.current_batch_report = report
     window._show_trait_preview_for_sample("1AB")
-    assert window.results_table.item(0, 1).text() == "11.11"
+    assert window.results_table.item(0, 1).text() == "11.11 cm^2"
 
     window._show_trait_preview_for_sample("2AB")
-    assert window.results_table.item(0, 1).text() == "22.22"
+    assert window.results_table.item(0, 1).text() == "22.22 cm^2"
     assert window.displayed_result is not None
     assert window.displayed_result.sample_id == "2AB"
     window.close()
