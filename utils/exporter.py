@@ -10,6 +10,8 @@ from core.batch_processor import BatchAnalysisReport, BatchSampleResult
 from core.grouping import PlantImageGroup
 from core.pipeline import PlantAnalysisResult, TRAIT_SPECS
 
+VIEW_SEQUENCE: tuple[str, ...] = ("TOP", "FRONT-1", "FRONT-2")
+
 
 def build_result_record(
     group: PlantImageGroup,
@@ -65,13 +67,70 @@ def build_result_record(
     return record
 
 
+def build_view_records(
+    group: PlantImageGroup,
+    result: PlantAnalysisResult,
+    *,
+    include_debug_fields: bool = False,
+) -> list[dict[str, Any]]:
+    """Flatten one grouped result into one export row per configured view."""
+
+    return [
+        _build_view_record(group, result, view_name, include_debug_fields=include_debug_fields)
+        for view_name in VIEW_SEQUENCE
+    ]
+
+
+def _build_view_record(
+    group: PlantImageGroup,
+    result: PlantAnalysisResult,
+    view_name: str,
+    *,
+    include_debug_fields: bool,
+) -> dict[str, Any]:
+    """Build one view-specific export record."""
+
+    record: dict[str, Any] = {
+        "sample_id": group.sample_id,
+        "view_name": view_name,
+    }
+
+    if include_debug_fields:
+        record.update(
+            {
+                "result_status": result.status,
+                "result_message": result.message,
+                "group_is_complete": group.is_complete,
+                "missing_views": ",".join(group.missing_views),
+                "image_path": _group_image_path(group, view_name),
+                "view_status": _view_status(result, view_name),
+                "calibration_status": _calibration_status(result, view_name),
+                "mm_per_pixel": _calibration_value(result, view_name, "mm_per_pixel"),
+                "error_count": len(result.errors),
+                "errors": " | ".join(result.errors),
+            }
+        )
+
+    for trait in result.traits:
+        if view_name not in trait.source_views:
+            continue
+        if include_debug_fields:
+            record[f"{trait.key}_value"] = trait.value
+            record[f"{trait.key}_unit"] = trait.unit
+            record[f"{trait.key}_status"] = trait.status
+            record[f"{trait.key}_message"] = trait.message
+        else:
+            record[trait.key] = trait.value
+    return record
+
+
 def build_batch_records(report: BatchAnalysisReport, *, include_debug_fields: bool = False) -> list[dict[str, Any]]:
     """Flatten one batch report into exportable tabular rows."""
 
-    return [
-        build_result_record(item.group, item.result, include_debug_fields=include_debug_fields)
-        for item in report.sample_results
-    ]
+    records: list[dict[str, Any]] = []
+    for item in report.sample_results:
+        records.extend(build_view_records(item.group, item.result, include_debug_fields=include_debug_fields))
+    return records
 
 
 def export_batch_report(report: BatchAnalysisReport, output_path: str | Path, *, include_debug_fields: bool = False) -> Path:
@@ -90,7 +149,7 @@ def export_single_result(
     """Export a single sample result to CSV or Excel."""
 
     return export_records(
-        [build_result_record(group, result, include_debug_fields=include_debug_fields)],
+        build_view_records(group, result, include_debug_fields=include_debug_fields),
         output_path,
     )
 
@@ -200,15 +259,31 @@ def _calibration_value(result: PlantAnalysisResult, view_name: str, attribute_na
     return getattr(calibration, attribute_name, None)
 
 
+def _group_image_path(group: PlantImageGroup, view_name: str) -> str:
+    """Return the input image path for a named view."""
+
+    image_path = {
+        "TOP": group.top_image,
+        "FRONT-1": group.front_0_image,
+        "FRONT-2": group.front_180_image,
+    }.get(view_name)
+    return str(image_path) if image_path else ""
+
+
 def _to_chinese_header(field_name: str) -> str:
     """Convert internal field names to Chinese Excel headers."""
 
     base_map = {
         "sample_id": "样本编号",
+        "view_name": "视角",
         "result_status": "结果状态",
         "result_message": "结果说明",
         "group_is_complete": "样本组完整",
         "missing_views": "缺失视角",
+        "image_path": "图像路径",
+        "view_status": "视角状态",
+        "calibration_status": "校准状态",
+        "mm_per_pixel": "毫米每像素",
         "top_image": "TOP图像路径",
         "front_1_image": "FRONT-1图像路径",
         "front_2_image": "FRONT-2图像路径",

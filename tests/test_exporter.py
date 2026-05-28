@@ -8,7 +8,7 @@ import pytest
 from core.batch_processor import BatchAnalysisReport, BatchSampleResult
 from core.grouping import PlantImageGroup
 from core.pipeline import PlantAnalysisResult, TraitResult
-from utils.exporter import build_result_record, export_batch_report, export_single_result
+from utils.exporter import build_result_record, build_view_records, export_batch_report, export_single_result
 
 
 def test_build_result_record_flattens_traits_and_statuses() -> None:
@@ -59,8 +59,29 @@ def test_build_result_record_includes_debug_fields_when_enabled() -> None:
     assert "leaf_area_message" in record
 
 
+def test_build_view_records_outputs_one_row_per_view() -> None:
+    """Export records should be split by TOP, FRONT-1, and FRONT-2 views."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    records = build_view_records(group, _build_result())
+
+    assert [record["view_name"] for record in records] == ["TOP", "FRONT-1", "FRONT-2"]
+    assert records[0]["leaf_area"] == 12.34
+    assert records[0]["flower_count"] == 3
+    assert "canopy_height" not in records[0]
+    assert records[1]["canopy_height"] == 7.89
+    assert records[1]["side_projection_area"] == 9.87
+    assert "flower_count" not in records[1]
+    assert records[2]["canopy_height"] == 7.89
+
+
 def test_export_single_result_writes_csv(tmp_path: Path) -> None:
-    """Single-sample export should create a CSV file."""
+    """Single-sample export should create one CSV row per view."""
 
     group = PlantImageGroup(sample_id="1AB")
     result = _build_result()
@@ -70,6 +91,10 @@ def test_export_single_result_writes_csv(tmp_path: Path) -> None:
     assert export_path.exists()
     content = export_path.read_text(encoding="utf-8-sig")
     assert "sample_id" in content
+    assert "view_name" in content
+    assert "TOP" in content
+    assert "FRONT-1" in content
+    assert "FRONT-2" in content
     assert "leaf_area" in content
     assert "top_calibration_status" not in content
     assert "errors" not in content
@@ -96,7 +121,9 @@ def test_export_batch_report_writes_excel(tmp_path: Path) -> None:
     workbook = load_workbook(export_path)
     worksheet = workbook.active
     headers = [cell.value for cell in worksheet[1]]
+    rows = list(worksheet.iter_rows(min_row=2, values_only=True))
     assert "样本编号" in headers
+    assert "视角" in headers
     assert "结果状态" not in headers
     assert "叶面积指数(cm^2)" in headers
     assert "冠层高度(cm)" in headers
@@ -104,6 +131,9 @@ def test_export_batch_report_writes_excel(tmp_path: Path) -> None:
     assert "花朵数(count)" in headers
     assert "果实数(count)" in headers
     assert "sample_id" not in headers
+    assert len(rows) == 3
+    view_column = headers.index("视角")
+    assert [row[view_column] for row in rows] == ["TOP", "FRONT-1", "FRONT-2"]
 
 
 def _build_result() -> PlantAnalysisResult:
