@@ -66,6 +66,25 @@ def test_segment_top_view_plant_removes_top_attached_pot_band() -> None:
     assert "top_band_candidate_mask" in result.debug_images
 
 
+def test_segment_top_view_plant_preserves_white_flowers_inside_canopy() -> None:
+    """TOP display mask should keep white petals and yellow centers near the green canopy."""
+
+    image = np.zeros((240, 320, 3), dtype=np.uint8)
+    cv2.circle(image, (150, 130), 70, (30, 170, 40), -1)
+    cv2.circle(image, (150, 130), 18, (245, 245, 245), -1)
+    cv2.circle(image, (150, 130), 6, (20, 215, 245), -1)
+    cv2.rectangle(image, (270, 88), (302, 148), (245, 245, 245), -1)
+
+    result = segment_top_view_plant(image)
+
+    assert result.mask[130, 150] == 255
+    assert result.leaf_mask is not None
+    assert result.leaf_mask[130, 150] == 0
+    assert result.mask[116, 150] == 255
+    assert result.mask[118, 286] == 0
+    assert cv2.countNonZero(result.debug_images["top_reproductive_mask"]) > 0
+
+
 def test_segment_top_view_plant_handles_empty_foreground() -> None:
     """A dark background with no canopy should report no foreground."""
 

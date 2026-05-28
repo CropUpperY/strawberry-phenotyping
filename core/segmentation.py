@@ -27,6 +27,7 @@ class TopSegmentationResult:
     contour_count: int
     bounding_box: tuple[int, int, int, int] | None
     debug_images: dict[str, np.ndarray] = field(default_factory=dict)
+    leaf_mask: np.ndarray | None = None
 
     @property
     def has_foreground(self) -> bool:
@@ -73,8 +74,15 @@ def segment_top_view_plant(
     filtered_mask, top_band_candidate, removed_top_band = _remove_top_attached_pot_band(filtered_mask)
     prepared["top_band_candidate_mask"] = top_band_candidate
     prepared["removed_top_pot_band"] = removed_top_band
-    prepared["filtered_mask"] = filtered_mask
-    contours = _find_external_contours(filtered_mask)
+    leaf_mask = filtered_mask
+    plant_mask, reproductive_debug = _augment_top_mask_with_reproductive_organs(
+        prepared["denoised"],
+        leaf_mask,
+    )
+    prepared.update(reproductive_debug)
+    prepared["leaf_mask"] = leaf_mask
+    prepared["filtered_mask"] = plant_mask
+    contours = _find_external_contours(plant_mask)
 
     if not contours:
         empty_overlay = image.copy()
@@ -92,6 +100,7 @@ def segment_top_view_plant(
             contour_count=0,
             bounding_box=None,
             debug_images=prepared,
+            leaf_mask=leaf_mask,
         )
 
     all_points = np.vstack(contours)
@@ -108,17 +117,18 @@ def segment_top_view_plant(
     return TopSegmentationResult(
         status="segmented",
         message="TOP-view strawberry canopy segmentation completed.",
-        mask=filtered_mask,
+        mask=plant_mask,
         contours=contours,
         largest_contour=largest_contour,
         convex_hull=convex_hull,
         contour_image=contour_image,
         hull_image=hull_image,
-        mask_area_pixels=int(cv2.countNonZero(filtered_mask)),
+        mask_area_pixels=int(cv2.countNonZero(plant_mask)),
         hull_area_pixels=float(cv2.contourArea(convex_hull)),
         contour_count=len(contours),
         bounding_box=tuple(int(value) for value in cv2.boundingRect(all_points)),
         debug_images=prepared,
+        leaf_mask=leaf_mask,
     )
 
 
@@ -356,6 +366,84 @@ def _filter_top_view_components(mask: np.ndarray) -> np.ndarray:
             filtered_mask[labels == component_index] = 0
 
     return filtered_mask
+
+
+def _augment_top_mask_with_reproductive_organs(
+    image: np.ndarray,
+    leaf_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Add white petals, yellow centers, and fruit-like organs near the TOP canopy back into the display mask."""
+
+    allowed_region = _build_top_reproductive_allowed_region(leaf_mask)
+    candidate_mask = _build_top_reproductive_candidate_mask(image)
+    reproductive_mask = cv2.bitwise_and(candidate_mask, allowed_region)
+
+    min_dim = min(leaf_mask.shape)
+    close_size = _make_odd(max(3, int(round(min_dim * 0.006))))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+    reproductive_mask = cv2.morphologyEx(reproductive_mask, cv2.MORPH_CLOSE, close_kernel)
+    reproductive_mask = _filter_small_components(reproductive_mask, min_component_area_ratio=0.00002)
+
+    plant_mask = cv2.bitwise_or(leaf_mask, reproductive_mask)
+    return plant_mask, {
+        "top_reproductive_allowed_region": allowed_region,
+        "top_reproductive_candidate_mask": candidate_mask,
+        "top_reproductive_mask": reproductive_mask,
+    }
+
+
+def _build_top_reproductive_allowed_region(leaf_mask: np.ndarray) -> np.ndarray:
+    """Limit flower/fruit recovery to the plant body so color cards and background highlights stay excluded."""
+
+    allowed_region = np.zeros_like(leaf_mask)
+    contours = _find_external_contours(leaf_mask)
+    if contours:
+        hull = cv2.convexHull(np.vstack(contours))
+        cv2.fillConvexPoly(allowed_region, hull, 255)
+
+    min_dim = min(leaf_mask.shape)
+    dilate_size = _make_odd(max(9, int(round(min_dim * 0.045))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+    dilated_leaf = cv2.dilate(leaf_mask, kernel, iterations=1)
+    return cv2.bitwise_or(allowed_region, dilated_leaf)
+
+
+def _build_top_reproductive_candidate_mask(image: np.ndarray) -> np.ndarray:
+    """Find non-green visible organs that should remain in the TOP display mask."""
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    bgr = image.astype(np.int16)
+    channel_min = np.min(bgr, axis=2)
+    channel_max = np.max(bgr, axis=2)
+    channel_spread = channel_max - channel_min
+
+    white_petals = (
+        (hsv[:, :, 1] <= 80)
+        & (hsv[:, :, 2] >= 145)
+        & (lab[:, :, 0] >= 145)
+        & (channel_min >= 120)
+        & (channel_spread <= 85)
+    )
+    yellow_centers = (
+        (hsv[:, :, 0] >= 10)
+        & (hsv[:, :, 0] <= 45)
+        & (hsv[:, :, 1] >= 45)
+        & (hsv[:, :, 2] >= 95)
+    )
+    pale_buds = (
+        (hsv[:, :, 0] >= 35)
+        & (hsv[:, :, 0] <= 95)
+        & (hsv[:, :, 1] >= 20)
+        & (hsv[:, :, 1] <= 150)
+        & (hsv[:, :, 2] >= 120)
+    )
+    red_fruits = (
+        (((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 165)))
+        & (hsv[:, :, 1] >= 70)
+        & (hsv[:, :, 2] >= 60)
+    )
+    return (white_petals | yellow_centers | pale_buds | red_fruits).astype(np.uint8) * 255
 
 
 def _remove_top_attached_pot_band(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

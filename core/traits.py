@@ -45,7 +45,9 @@ def compute_top_traits(top_image: np.ndarray, top_segmentation: Any) -> TopTrait
     if top_image.ndim != 3 or top_image.shape[2] != 3:
         raise ValueError("top_image must be a 3-channel BGR image")
 
-    mask = getattr(top_segmentation, "mask", None)
+    mask = getattr(top_segmentation, "leaf_mask", None)
+    if mask is None:
+        mask = getattr(top_segmentation, "mask", None)
     if mask is None or mask.ndim != 2:
         raise ValueError("top_segmentation must provide a single-channel mask")
 

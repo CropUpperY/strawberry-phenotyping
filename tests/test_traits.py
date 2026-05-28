@@ -20,6 +20,29 @@ class DummyTopSegmentation:
         self.convex_hull = np.array([[[0, 0]], [[2, 0]], [[2, 1]], [[0, 1]]], dtype=np.int32)
 
 
+class DummyTopSegmentationWithLeafMask(DummyTopSegmentation):
+    """TOP segmentation where display mask contains a flower but leaf_mask excludes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mask = np.array(
+            [
+                [0, 255, 255],
+                [0, 255, 255],
+                [0, 0, 255],
+            ],
+            dtype=np.uint8,
+        )
+        self.leaf_mask = np.array(
+            [
+                [0, 255, 255],
+                [0, 255, 255],
+                [0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
+
+
 class DummyFrontSegmentation:
     """Minimal FRONT segmentation object for trait computation tests."""
 
@@ -45,6 +68,24 @@ def test_compute_top_traits_returns_expected_values() -> None:
     assert measurements.convex_hull_area_pixels == 10.5
     assert measurements.canopy_diameter_pixels > 0
     assert measurements.canopy_diameter_endpoints is not None
+    assert measurements.greenness_exg_mean > 0
+
+
+def test_compute_top_traits_prefers_leaf_mask_over_display_mask() -> None:
+    """Leaf traits should not count flowers that are only present in the display plant mask."""
+
+    image = np.array(
+        [
+            [[0, 0, 0], [10, 100, 10], [10, 120, 10]],
+            [[0, 0, 0], [10, 140, 10], [10, 160, 10]],
+            [[0, 0, 0], [245, 245, 245], [245, 245, 245]],
+        ],
+        dtype=np.uint8,
+    )
+
+    measurements = compute_top_traits(image, DummyTopSegmentationWithLeafMask())
+
+    assert measurements.leaf_area_pixels == 4
     assert measurements.greenness_exg_mean > 0
 
 
