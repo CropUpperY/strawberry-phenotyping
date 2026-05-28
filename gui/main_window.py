@@ -2207,7 +2207,11 @@ class StrawberryMainWindow(QMainWindow):
             if segmentation is None or getattr(segmentation, "mask", None) is None:
                 return None
             masked_image = create_masked_color_image(source_image, segmentation.mask)
-            final_image = self._build_top_phenotype_overlay(masked_image, segmentation)
+            final_image = self._build_top_phenotype_overlay(
+                masked_image,
+                segmentation,
+                organ_detection=result.top_organ_detection,
+            )
         else:
             segmentation = result.front_segmentations.get(view_name)
             if segmentation is None or getattr(segmentation, "mask", None) is None:
@@ -2225,7 +2229,13 @@ class StrawberryMainWindow(QMainWindow):
             "final": final_payload,
         }
 
-    def _build_top_phenotype_overlay(self, masked_image: np.ndarray, segmentation: Any) -> np.ndarray:
+    def _build_top_phenotype_overlay(
+        self,
+        masked_image: np.ndarray,
+        segmentation: Any,
+        *,
+        organ_detection: Any | None = None,
+    ) -> np.ndarray:
         """Draw TOP phenotype measurements on the background-removed plant image."""
 
         overlay = masked_image.copy()
@@ -2240,7 +2250,64 @@ class StrawberryMainWindow(QMainWindow):
         convex_hull = getattr(segmentation, "convex_hull", None)
         if convex_hull is not None:
             cv2.polylines(overlay, [convex_hull], True, (255, 255, 0), line_width)
+        self._draw_top_organ_detection_overlay(overlay, organ_detection, line_width=line_width)
         return overlay
+
+    def _draw_top_organ_detection_overlay(
+        self,
+        overlay: np.ndarray,
+        organ_detection: Any | None,
+        *,
+        line_width: int,
+    ) -> None:
+        """Draw YOLO flower, flower-bud, and fruit detections on the TOP phenotype preview."""
+
+        if cv2 is None or organ_detection is None:
+            return
+
+        color_map = {
+            "flower": (255, 255, 255),
+            "flower_bud": (0, 215, 255),
+            "fruit": (0, 0, 255),
+        }
+        label_map = {
+            "flower": "flower",
+            "flower_bud": "bud",
+            "fruit": "fruit",
+        }
+        height, width = overlay.shape[:2]
+        for instance in getattr(organ_detection, "instances", []) or []:
+            class_name = str(getattr(instance, "class_name", ""))
+            color = color_map.get(class_name)
+            if color is None:
+                continue
+
+            bounding_box = getattr(instance, "bounding_box", None)
+            if bounding_box is None or len(bounding_box) != 4:
+                continue
+            x1, y1, x2, y2 = (int(round(float(value))) for value in bounding_box)
+            x1 = max(0, min(width - 1, x1))
+            y1 = max(0, min(height - 1, y1))
+            x2 = max(0, min(width - 1, x2))
+            y2 = max(0, min(height - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, line_width)
+            confidence = getattr(instance, "confidence", None)
+            label = label_map[class_name]
+            if confidence is not None:
+                label = f"{label} {float(confidence):.2f}"
+            cv2.putText(
+                overlay,
+                label,
+                (x1, max(14, y1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                max(1, line_width - 1),
+                cv2.LINE_AA,
+            )
 
     def _build_front_phenotype_overlay(self, masked_image: np.ndarray, segmentation: Any) -> np.ndarray:
         """Draw FRONT phenotype measurements on the background-removed plant image."""

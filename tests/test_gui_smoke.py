@@ -493,6 +493,15 @@ def test_phenotype_stage_payloads_use_in_memory_results_without_saved_visualizat
             convex_hull=np.array([[[5, 4]], [[18, 4]], [[18, 19]], [[5, 19]]], dtype=np.int32),
             hull_image=np.full((24, 24, 3), (0, 255, 255), dtype=np.uint8),
         ),
+        top_organ_detection=SimpleNamespace(
+            instances=[
+                SimpleNamespace(
+                    class_name="fruit",
+                    confidence=0.91,
+                    bounding_box=(9, 9, 13, 13),
+                ),
+            ],
+        ),
         front_segmentations={
             "FRONT-1": SimpleNamespace(
                 mask=front_1_mask,
@@ -515,6 +524,7 @@ def test_phenotype_stage_payloads_use_in_memory_results_without_saved_visualizat
     assert top_payloads["final"].image_array is not None
     assert np.array_equal(top_payloads["final"].image_array[0, 0], np.array([0, 0, 0], dtype=np.uint8))
     assert np.any(np.all(top_payloads["final"].image_array == np.array([255, 255, 0], dtype=np.uint8), axis=2))
+    assert np.array_equal(top_payloads["final"].image_array[9, 9], np.array([0, 0, 255], dtype=np.uint8))
     assert front_payloads["masked"].image_array is not None
     assert front_payloads["final"].image_array is not None
     window.close()
