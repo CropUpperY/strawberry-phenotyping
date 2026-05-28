@@ -70,6 +70,26 @@ class FakeOrganDetectionResult:
         }
 
 
+class FakeYoloOrganDetectionResult:
+    """Simple stand-in for combined YOLO organ detection payloads."""
+
+    def __init__(self, *, flower_count: int, flower_bud_count: int, fruit_count: int, height: int, width: int) -> None:
+        self.status = "computed"
+        self.message = "ok"
+        self.flower_count = flower_count
+        self.flower_bud_count = flower_bud_count
+        self.fruit_count = fruit_count
+        self.counts = {
+            "flower": flower_count,
+            "flower_bud": flower_bud_count,
+            "fruit": fruit_count,
+        }
+        self.overlay_image = np.zeros((height, width, 3), dtype=np.uint8)
+        self.debug_images = {
+            "overlay": self.overlay_image,
+        }
+
+
 def _build_fake_calibration(image: np.ndarray, *, view_name: str, mm_per_pixel: float | None) -> SimpleNamespace:
     """Build a calibration-like payload for pipeline tests."""
 
@@ -242,7 +262,8 @@ def test_create_result_rows_reflects_trait_results() -> None:
     assert rows[0][0] == "叶面积"
     assert rows[0][3] == "cm^2"
     assert rows[0][4] == "已计算"
-    assert rows[-2][0] == "花朵数"
+    assert rows[-3][0] == "花朵数"
+    assert rows[-2][0] == "花骨朵数"
     assert rows[-1][0] == "果实数"
 
 
@@ -287,9 +308,10 @@ def test_analyze_plant_group_exports_debug_artifacts(tmp_path: Path) -> None:
         "canopy_width",
         "side_projection_area",
         "flower_count",
+        "flower_bud_count",
         "fruit_count",
     }
-    assert all(paths for paths in result.debug_artifact_paths.values())
+    assert all(paths for key, paths in result.debug_artifact_paths.items() if key != "flower_bud_count")
     assert result.debug_artifact_paths["color_calibration"][0].exists()
     assert len(result.debug_artifact_paths["front_segmentation"]) >= 12
 
@@ -330,6 +352,48 @@ def test_analyze_plant_group_populates_flower_and_fruit_counts() -> None:
     assert trait_map["fruit_count"].value == 2
     assert trait_map["fruit_count"].unit == "count"
     assert trait_map["fruit_count"].status == "computed"
+    assert trait_map["flower_bud_count"].value is None
+    assert trait_map["flower_bud_count"].status == "pending_algorithm"
+
+
+def test_analyze_plant_group_populates_yolo_flower_bud_count() -> None:
+    """Combined YOLO TOP detection should populate flower, flower bud, and fruit traits."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((24, 24, 3), (20, 140, 20), dtype=np.uint8)
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2),
+        top_organ_detector=lambda top_image, canopy_mask: FakeYoloOrganDetectionResult(
+            flower_count=3,
+            flower_bud_count=4,
+            fruit_count=2,
+            height=top_image.shape[0],
+            width=top_image.shape[1],
+        ),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert trait_map["flower_count"].value == 3
+    assert trait_map["flower_bud_count"].value == 4
+    assert trait_map["fruit_count"].value == 2
 
 
 def test_analyze_plant_group_exports_flower_and_fruit_debug_artifacts(tmp_path: Path) -> None:
@@ -361,6 +425,7 @@ def test_analyze_plant_group_exports_flower_and_fruit_debug_artifacts(tmp_path: 
     )
 
     assert "flower_count" in result.debug_artifact_paths
+    assert "flower_bud_count" in result.debug_artifact_paths
     assert "fruit_count" in result.debug_artifact_paths
     assert result.debug_artifact_paths["flower_count"][0].exists()
     assert result.debug_artifact_paths["fruit_count"][0].exists()
@@ -399,6 +464,8 @@ def test_analyze_plant_group_keeps_main_traits_when_organ_detector_raises() -> N
     assert result.status == "analysis_complete"
     assert trait_map["leaf_area"].status == "computed"
     assert trait_map["flower_count"].value is None
+    assert trait_map["flower_bud_count"].value is None
     assert trait_map["fruit_count"].value is None
     assert trait_map["flower_count"].status == "segmentation_failed"
+    assert trait_map["flower_bud_count"].status == "pending_algorithm"
     assert trait_map["fruit_count"].status == "segmentation_failed"

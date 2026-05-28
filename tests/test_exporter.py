@@ -32,6 +32,7 @@ def test_build_result_record_flattens_traits_and_statuses() -> None:
     assert record["leaf_area"] == 12.34
     assert record["canopy_height"] == 7.89
     assert record["flower_count"] == 3
+    assert record["flower_bud_count"] == 4
     assert record["fruit_count"] == 2
     assert "top_calibration_status" not in record
     assert "errors" not in record
@@ -116,6 +117,7 @@ def _build_result() -> PlantAnalysisResult:
         TraitResult("canopy_width", "植株冠径", ("TOP",), "cm", 8.9, "computed", "ok"),
         TraitResult("side_projection_area", "侧视投影面积", ("FRONT-1", "FRONT-2"), "cm^2", 9.87, "computed", "ok"),
         TraitResult("flower_count", "花朵数", ("TOP",), "count", 3, "computed", "ok"),
+        TraitResult("flower_bud_count", "花骨朵数", ("TOP",), "count", 4, "computed", "ok"),
         TraitResult("fruit_count", "果实数", ("TOP",), "count", 2, "computed", "ok"),
     ]
     return PlantAnalysisResult(

@@ -11,6 +11,7 @@ import numpy as np
 from core.grouping import PlantImageGroup
 from core.organs import detect_top_flowers, detect_top_fruits
 from core.traits import compute_front_view_traits, compute_top_traits, fuse_front_traits
+from core.yolo_counter import detect_top_organs_with_yolo, resolve_default_model_path
 from utils.debug_artifacts import (
     create_debug_montage,
     create_gray_background_focus_image,
@@ -50,6 +51,7 @@ FrontSegmenter = Callable[[Any], Any]
 ImageCalibrator = Callable[..., Any]
 TopFlowerDetector = Callable[[np.ndarray, np.ndarray], Any]
 TopFruitDetector = Callable[[np.ndarray, np.ndarray], Any]
+TopOrganDetector = Callable[[np.ndarray, np.ndarray], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +113,9 @@ class PlantAnalysisResult:
     debug_artifact_paths: dict[str, list[Path]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     top_flower_detection: Any | None = None
+    top_flower_bud_detection: Any | None = None
     top_fruit_detection: Any | None = None
+    top_organ_detection: Any | None = None
 
     def trait_map(self) -> dict[str, TraitResult]:
         """Return trait results keyed by trait key."""
@@ -127,6 +131,7 @@ TRAIT_SPECS: tuple[TraitSpec, ...] = (
     TraitSpec("canopy_width", "植株冠径", (VIEW_TOP,), "cm"),
     TraitSpec("side_projection_area", "侧视投影面积", (VIEW_FRONT_0, VIEW_FRONT_180), "cm^2"),
     TraitSpec("flower_count", "花朵数", (VIEW_TOP,), "count"),
+    TraitSpec("flower_bud_count", "花骨朵数", (VIEW_TOP,), "count"),
     TraitSpec("fruit_count", "果实数", (VIEW_TOP,), "count"),
 )
 
@@ -141,6 +146,7 @@ def analyze_plant_group(
     image_calibrator: ImageCalibrator | None = None,
     top_flower_detector: TopFlowerDetector | None = None,
     top_fruit_detector: TopFruitDetector | None = None,
+    top_organ_detector: TopOrganDetector | None = None,
     calibration_reference: Any | None = None,
     debug_output_dir: str | Path | None = None,
     manual_color_card_regions: dict[str, tuple[int, int, int, int]] | None = None,
@@ -182,6 +188,18 @@ def analyze_plant_group(
         _emit(emit_log, result.message)
         return result
 
+    has_injected_components = any(
+        component is not None
+        for component in (
+            image_loader,
+            top_segmenter,
+            front_segmenter,
+            image_calibrator,
+            top_flower_detector,
+            top_fruit_detector,
+        )
+    )
+
     image_loader = image_loader or _resolve_image_loader(result, emit_log)
     if image_loader is None:
         return result
@@ -198,6 +216,9 @@ def analyze_plant_group(
     if image_calibrator is None:
         return result
 
+    top_organ_detector = top_organ_detector or (
+        None if has_injected_components else _resolve_top_organ_detector(result, emit_log)
+    )
     top_flower_detector = top_flower_detector or detect_top_flowers
     top_fruit_detector = top_fruit_detector or detect_top_fruits
 
@@ -270,19 +291,28 @@ def analyze_plant_group(
         return result
     result.front_segmentations[VIEW_FRONT_180] = front_180_segmentation
 
-    try:
-        result.top_flower_detection = top_flower_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
-    except Exception as error:  # noqa: BLE001
-        result.errors.append(f"TOP flower detection failed: {error}")
-        _emit(emit_log, f"TOP flower detection failed: {error}")
-        result.top_flower_detection = None
+    if top_organ_detector is not None:
+        try:
+            result.top_organ_detection = top_organ_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+        except Exception as error:  # noqa: BLE001
+            result.errors.append(f"TOP YOLO organ detection failed: {error}")
+            _emit(emit_log, f"TOP YOLO organ detection failed: {error}")
+            result.top_organ_detection = None
 
-    try:
-        result.top_fruit_detection = top_fruit_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
-    except Exception as error:  # noqa: BLE001
-        result.errors.append(f"TOP fruit detection failed: {error}")
-        _emit(emit_log, f"TOP fruit detection failed: {error}")
-        result.top_fruit_detection = None
+    if result.top_organ_detection is None:
+        try:
+            result.top_flower_detection = top_flower_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+        except Exception as error:  # noqa: BLE001
+            result.errors.append(f"TOP flower detection failed: {error}")
+            _emit(emit_log, f"TOP flower detection failed: {error}")
+            result.top_flower_detection = None
+
+        try:
+            result.top_fruit_detection = top_fruit_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+        except Exception as error:  # noqa: BLE001
+            result.errors.append(f"TOP fruit detection failed: {error}")
+            _emit(emit_log, f"TOP fruit detection failed: {error}")
+            result.top_fruit_detection = None
 
     if debug_output_dir is not None:
         output_root = Path(debug_output_dir)
@@ -316,6 +346,7 @@ def analyze_plant_group(
         result.debug_artifact_paths.update(
             _export_top_organ_debug_artifacts(
                 sample_id=group.sample_id,
+                organ_detection=result.top_organ_detection,
                 flower_detection=result.top_flower_detection,
                 fruit_detection=result.top_fruit_detection,
                 output_root=output_root,
@@ -334,6 +365,7 @@ def analyze_plant_group(
     )
     _apply_top_organ_counts(
         result,
+        organ_detection=result.top_organ_detection,
         flower_detection=result.top_flower_detection,
         fruit_detection=result.top_fruit_detection,
         calibration=result.calibration_results.get(VIEW_TOP),
@@ -448,6 +480,25 @@ def _resolve_image_calibrator(result: PlantAnalysisResult, emit_log: LogCallback
         return None
 
     return calibrate_image_with_color_card
+
+
+def _resolve_top_organ_detector(result: PlantAnalysisResult, emit_log: LogCallback | None) -> TopOrganDetector | None:
+    """Resolve the packaged YOLO TOP organ detector when models/best.onnx is available."""
+
+    model_path = resolve_default_model_path()
+    if not model_path.exists():
+        _emit(emit_log, f"TOP YOLO organ model not found, using legacy color detectors: {model_path}")
+        return None
+
+    try:
+        import onnxruntime  # noqa: F401, PLC0415
+    except Exception as error:  # noqa: BLE001
+        message = f"TOP YOLO organ detector unavailable, using legacy color detectors: {error}"
+        result.errors.append(message)
+        _emit(emit_log, message)
+        return None
+
+    return detect_top_organs_with_yolo
 
 
 def _load_group_images(
@@ -715,11 +766,12 @@ def _apply_top_trait_measurements(result: PlantAnalysisResult, measurements: Any
 def _apply_top_organ_counts(
     result: PlantAnalysisResult,
     *,
+    organ_detection: Any | None,
     flower_detection: Any,
     fruit_detection: Any,
     calibration: Any | None,
 ) -> None:
-    """Update TOP flower and fruit count traits."""
+    """Update TOP flower, flower-bud, and fruit count traits."""
 
     trait_map = result.trait_map()
     image_note = (
@@ -727,6 +779,23 @@ def _apply_top_organ_counts(
         if bool(getattr(calibration, "is_calibrated", False))
         else "基于原始 TOP 图像，可信度较低"
     )
+
+    if organ_detection is not None:
+        trait_map["flower_count"].value = int(getattr(organ_detection, "flower_count", 0))
+        trait_map["flower_count"].unit = "count"
+        trait_map["flower_count"].status = "computed"
+        trait_map["flower_count"].message = f"{image_note}使用 YOLOv8 统计可见开放花朵数量。"
+
+        trait_map["flower_bud_count"].value = int(getattr(organ_detection, "flower_bud_count", 0))
+        trait_map["flower_bud_count"].unit = "count"
+        trait_map["flower_bud_count"].status = "computed"
+        trait_map["flower_bud_count"].message = f"{image_note}使用 YOLOv8 统计可见花骨朵数量。"
+
+        trait_map["fruit_count"].value = int(getattr(organ_detection, "fruit_count", 0))
+        trait_map["fruit_count"].unit = "count"
+        trait_map["fruit_count"].status = "computed"
+        trait_map["fruit_count"].message = f"{image_note}使用 YOLOv8 统计可见果实数量。"
+        return
 
     if flower_detection is None:
         trait_map["flower_count"].value = None
@@ -738,6 +807,11 @@ def _apply_top_organ_counts(
         trait_map["flower_count"].unit = "count"
         trait_map["flower_count"].status = "computed"
         trait_map["flower_count"].message = f"{image_note}统计俯视图可见开放白花数量。"
+
+    trait_map["flower_bud_count"].value = None
+    trait_map["flower_bud_count"].unit = "count"
+    trait_map["flower_bud_count"].status = "pending_algorithm"
+    trait_map["flower_bud_count"].message = "花骨朵识别需要 YOLOv8 模型，当前使用传统颜色检测回退。"
 
     if fruit_detection is None:
         trait_map["fruit_count"].value = None
@@ -1016,11 +1090,24 @@ def _export_front_trait_debug_artifacts(
 def _export_top_organ_debug_artifacts(
     *,
     sample_id: str,
+    organ_detection: Any | None,
     flower_detection: Any,
     fruit_detection: Any,
     output_root: Path,
 ) -> dict[str, list[Path]]:
-    """Save flower and fruit detection debug images for the current sample."""
+    """Save TOP organ detection debug images for the current sample."""
+
+    if organ_detection is not None:
+        organ_debug = getattr(organ_detection, "debug_images", {})
+        organ_steps = _collect_debug_steps(
+            ("yolo_overlay", getattr(organ_detection, "overlay_image", None)),
+            ("yolo_debug_overlay", organ_debug.get("overlay")),
+        )
+        return {
+            "flower_count": save_debug_steps(sample_id, "flower_count", organ_steps, output_root=output_root),
+            "flower_bud_count": save_debug_steps(sample_id, "flower_bud_count", organ_steps, output_root=output_root),
+            "fruit_count": save_debug_steps(sample_id, "fruit_count", organ_steps, output_root=output_root),
+        }
 
     flower_debug = getattr(flower_detection, "debug_images", {})
     fruit_debug = getattr(fruit_detection, "debug_images", {})
@@ -1043,6 +1130,7 @@ def _export_top_organ_debug_artifacts(
     )
     return {
         "flower_count": save_debug_steps(sample_id, "flower_count", flower_steps, output_root=output_root),
+        "flower_bud_count": [],
         "fruit_count": save_debug_steps(sample_id, "fruit_count", fruit_steps, output_root=output_root),
     }
 
@@ -1151,6 +1239,7 @@ def _build_summary_message(result: PlantAnalysisResult) -> str:
         f" 植株冠径={trait_map['canopy_width'].display_value} {trait_map['canopy_width'].unit},"
         f" 侧视投影面积={trait_map['side_projection_area'].display_value} {trait_map['side_projection_area'].unit},"
         f" 花朵数={trait_map['flower_count'].display_value} {trait_map['flower_count'].unit},"
+        f" 花骨朵数={trait_map['flower_bud_count'].display_value} {trait_map['flower_bud_count'].unit},"
         f" 果实数={trait_map['fruit_count'].display_value} {trait_map['fruit_count'].unit}。"
     )
 
