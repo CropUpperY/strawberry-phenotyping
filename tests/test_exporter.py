@@ -8,7 +8,13 @@ import pytest
 from core.batch_processor import BatchAnalysisReport, BatchSampleResult
 from core.grouping import PlantImageGroup
 from core.pipeline import PlantAnalysisResult, TraitResult
-from utils.exporter import build_result_record, build_view_records, export_batch_report, export_single_result
+from utils.exporter import (
+    _to_chinese_header,
+    build_result_record,
+    build_view_records,
+    export_batch_report,
+    export_single_result,
+)
 
 
 def test_build_result_record_flattens_traits_and_statuses() -> None:
@@ -31,6 +37,8 @@ def test_build_result_record_flattens_traits_and_statuses() -> None:
     assert "missing_views" not in record
     assert record["leaf_area"] == 12.34
     assert record["canopy_height"] == 7.89
+    assert record["fruit_area"] == 1.23
+    assert record["source_sink_ratio"] == 10.03
     assert record["flower_count"] == 3
     assert record["flower_bud_count"] == 4
     assert record["fruit_count"] == 2
@@ -72,11 +80,15 @@ def test_build_view_records_outputs_one_row_per_view() -> None:
 
     assert [record["view_name"] for record in records] == ["TOP", "FRONT-1", "FRONT-2"]
     assert records[0]["leaf_area"] == 12.34
+    assert records[0]["fruit_area"] == 1.23
+    assert records[0]["source_sink_ratio"] == 10.03
     assert records[0]["flower_count"] == 3
     assert "canopy_height" not in records[0]
     assert records[1]["canopy_height"] == 4.0
     assert records[1]["side_projection_area"] == 2.0
     assert "flower_count" not in records[1]
+    assert "fruit_area" not in records[1]
+    assert "source_sink_ratio" not in records[1]
     assert records[2]["canopy_height"] == 6.0
     assert records[2]["side_projection_area"] == 4.0
 
@@ -129,6 +141,8 @@ def test_export_batch_report_writes_excel(tmp_path: Path) -> None:
     assert "叶面积指数(cm^2)" in headers
     assert "冠层高度(cm)" in headers
     assert "植株冠径(cm)" in headers
+    assert _to_chinese_header("fruit_area") in headers
+    assert _to_chinese_header("source_sink_ratio") in headers
     assert "花朵数(count)" in headers
     assert "果实数(count)" in headers
     assert "sample_id" not in headers
@@ -147,6 +161,8 @@ def _build_result() -> PlantAnalysisResult:
         TraitResult("canopy_height", "冠层高度", ("FRONT-1", "FRONT-2"), "cm", 7.89, "computed", "ok"),
         TraitResult("canopy_width", "植株冠径", ("TOP",), "cm", 8.9, "computed", "ok"),
         TraitResult("side_projection_area", "侧视投影面积", ("FRONT-1", "FRONT-2"), "cm^2", 9.87, "computed", "ok"),
+        TraitResult("fruit_area", "果实面积", ("TOP",), "cm^2", 1.23, "computed", "ok"),
+        TraitResult("source_sink_ratio", "源库比", ("TOP",), "", 10.03, "computed", "ok"),
         TraitResult("flower_count", "花朵数", ("TOP",), "count", 3, "computed", "ok"),
         TraitResult("flower_bud_count", "花骨朵数", ("TOP",), "count", 4, "computed", "ok"),
         TraitResult("fruit_count", "果实数", ("TOP",), "count", 2, "computed", "ok"),

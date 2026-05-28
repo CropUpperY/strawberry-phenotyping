@@ -52,11 +52,11 @@ class FakeFrontSegmentationResult:
 class FakeOrganDetectionResult:
     """Simple stand-in for flower/fruit detection payloads."""
 
-    def __init__(self, count: int, height: int, width: int) -> None:
+    def __init__(self, count: int, height: int, width: int, *, mask: np.ndarray | None = None) -> None:
         self.status = "computed"
         self.message = "ok"
         self.count = count
-        self.mask = np.zeros((height, width), dtype=np.uint8)
+        self.mask = mask.copy() if mask is not None else np.zeros((height, width), dtype=np.uint8)
         self.labeled_mask = np.zeros((height, width), dtype=np.int32)
         self.instances = []
         self.overlay_image = np.zeros((height, width, 3), dtype=np.uint8)
@@ -262,9 +262,10 @@ def test_create_result_rows_reflects_trait_results() -> None:
     assert rows[0][0] == "叶面积"
     assert rows[0][3] == "cm^2"
     assert rows[0][4] == "已计算"
-    assert rows[-3][0] == "花朵数"
-    assert rows[-2][0] == "花骨朵数"
-    assert rows[-1][0] == "果实数"
+    labels = [row[0] for row in rows]
+    assert "花朵数" in labels
+    assert "花骨朵数" in labels
+    assert "果实数" in labels
 
 
 def test_analyze_plant_group_exports_debug_artifacts(tmp_path: Path) -> None:
@@ -354,6 +355,180 @@ def test_analyze_plant_group_populates_flower_and_fruit_counts() -> None:
     assert trait_map["fruit_count"].status == "computed"
     assert trait_map["flower_bud_count"].value is None
     assert trait_map["flower_bud_count"].status == "pending_algorithm"
+
+
+def test_analyze_plant_group_computes_fruit_area_and_source_sink_ratio() -> None:
+    """Fruit masks should produce calibrated fruit_area and source_sink_ratio values."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((20, 25, 3), (20, 140, 20), dtype=np.uint8)
+    fruit_mask = np.zeros((20, 25), dtype=np.uint8)
+    fruit_mask[10:15, 8:18] = 255
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2),
+        top_flower_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(3, top_image.shape[0], top_image.shape[1]),
+        top_fruit_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(
+            2,
+            top_image.shape[0],
+            top_image.shape[1],
+            mask=fruit_mask,
+        ),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert trait_map["fruit_area"].value == 0.02
+    assert trait_map["fruit_area"].unit == "cm^2"
+    assert trait_map["fruit_area"].status == "computed"
+    assert trait_map["source_sink_ratio"].value == 10.0
+    assert trait_map["source_sink_ratio"].unit == ""
+    assert trait_map["source_sink_ratio"].status == "computed"
+
+
+def test_analyze_plant_group_keeps_ratio_when_top_calibration_missing() -> None:
+    """Missing TOP calibration should keep fruit_area in pixels and still compute source_sink_ratio."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((20, 25, 3), (20, 140, 20), dtype=np.uint8)
+    fruit_mask = np.zeros((20, 25), dtype=np.uint8)
+    fruit_mask[10:15, 8:18] = 255
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=None),
+        top_flower_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(3, top_image.shape[0], top_image.shape[1]),
+        top_fruit_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(
+            2,
+            top_image.shape[0],
+            top_image.shape[1],
+            mask=fruit_mask,
+        ),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert trait_map["fruit_area"].value == 50
+    assert trait_map["fruit_area"].unit == "px^2"
+    assert trait_map["fruit_area"].status == "computed"
+    assert trait_map["source_sink_ratio"].value == 10.0
+    assert trait_map["source_sink_ratio"].unit == ""
+    assert trait_map["source_sink_ratio"].status == "computed"
+
+
+def test_analyze_plant_group_returns_empty_ratio_when_no_fruit_detected() -> None:
+    """A zero-area fruit mask should keep fruit_area at zero and leave source_sink_ratio empty."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((20, 25, 3), (20, 140, 20), dtype=np.uint8)
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2),
+        top_flower_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(3, top_image.shape[0], top_image.shape[1]),
+        top_fruit_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(0, top_image.shape[0], top_image.shape[1]),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert trait_map["fruit_area"].value == 0
+    assert trait_map["fruit_area"].status == "computed"
+    assert trait_map["source_sink_ratio"].value is None
+    assert trait_map["source_sink_ratio"].status == "computed"
+
+
+def test_analyze_plant_group_uses_classic_fruit_mask_for_area_when_yolo_counts_are_available() -> None:
+    """YOLO can supply counts while classic fruit masks still supply area and ratio."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((20, 25, 3), (20, 140, 20), dtype=np.uint8)
+    fruit_mask = np.zeros((20, 25), dtype=np.uint8)
+    fruit_mask[10:15, 8:18] = 255
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2),
+        top_organ_detector=lambda top_image, canopy_mask: FakeYoloOrganDetectionResult(
+            flower_count=3,
+            flower_bud_count=4,
+            fruit_count=2,
+            height=top_image.shape[0],
+            width=top_image.shape[1],
+        ),
+        top_fruit_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(
+            2,
+            top_image.shape[0],
+            top_image.shape[1],
+            mask=fruit_mask,
+        ),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert trait_map["fruit_count"].value == 2
+    assert trait_map["fruit_area"].value == 0.02
+    assert trait_map["source_sink_ratio"].value == 10.0
 
 
 def test_analyze_plant_group_populates_yolo_flower_bud_count() -> None:
@@ -484,6 +659,10 @@ def test_analyze_plant_group_keeps_main_traits_when_organ_detector_raises() -> N
     assert trait_map["flower_count"].value is None
     assert trait_map["flower_bud_count"].value is None
     assert trait_map["fruit_count"].value is None
+    assert trait_map["fruit_area"].value is None
+    assert trait_map["source_sink_ratio"].value is None
     assert trait_map["flower_count"].status == "segmentation_failed"
     assert trait_map["flower_bud_count"].status == "pending_algorithm"
     assert trait_map["fruit_count"].status == "segmentation_failed"
+    assert trait_map["fruit_area"].status == "segmentation_failed"
+    assert trait_map["source_sink_ratio"].status == "segmentation_failed"

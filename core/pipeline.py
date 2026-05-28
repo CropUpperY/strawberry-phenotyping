@@ -133,6 +133,8 @@ TRAIT_SPECS: tuple[TraitSpec, ...] = (
     TraitSpec("flower_count", "花朵数", (VIEW_TOP,), "count"),
     TraitSpec("flower_bud_count", "花骨朵数", (VIEW_TOP,), "count"),
     TraitSpec("fruit_count", "果实数", (VIEW_TOP,), "count"),
+    TraitSpec("fruit_area", "果实面积", (VIEW_TOP,), "cm^2"),
+    TraitSpec("source_sink_ratio", "源库比", (VIEW_TOP,), ""),
 )
 
 
@@ -308,12 +310,12 @@ def analyze_plant_group(
             _emit(emit_log, f"TOP flower detection failed: {error}")
             result.top_flower_detection = None
 
-        try:
-            result.top_fruit_detection = top_fruit_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
-        except Exception as error:  # noqa: BLE001
-            result.errors.append(f"TOP fruit detection failed: {error}")
-            _emit(emit_log, f"TOP fruit detection failed: {error}")
-            result.top_fruit_detection = None
+    try:
+        result.top_fruit_detection = top_fruit_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+    except Exception as error:  # noqa: BLE001
+        result.errors.append(f"TOP fruit detection failed: {error}")
+        _emit(emit_log, f"TOP fruit detection failed: {error}")
+        result.top_fruit_detection = None
 
     if debug_output_dir is not None:
         output_root = Path(debug_output_dir)
@@ -796,14 +798,11 @@ def _apply_top_organ_counts(
     fruit_detection: Any,
     calibration: Any | None,
 ) -> None:
-    """Update TOP flower, flower-bud, and fruit count traits."""
+    """Update TOP organ-derived count and area traits."""
 
     trait_map = result.trait_map()
-    image_note = (
-        "基于色卡校正后的 TOP 图像"
-        if bool(getattr(calibration, "is_calibrated", False))
-        else "基于原始 TOP 图像，可信度较低"
-    )
+    is_calibrated = bool(getattr(calibration, "is_calibrated", False))
+    image_note = "基于色卡校正后的 TOP 图像" if is_calibrated else "基于原始 TOP 图像，可信度较低"
 
     if organ_detection is not None:
         trait_map["flower_count"].value = int(getattr(organ_detection, "flower_count", 0))
@@ -820,34 +819,87 @@ def _apply_top_organ_counts(
         trait_map["fruit_count"].unit = "count"
         trait_map["fruit_count"].status = "computed"
         trait_map["fruit_count"].message = f"{image_note}使用 YOLOv8 统计可见果实数量。"
-        return
-
-    if flower_detection is None:
-        trait_map["flower_count"].value = None
-        trait_map["flower_count"].unit = "count"
-        trait_map["flower_count"].status = "segmentation_failed"
-        trait_map["flower_count"].message = "花朵识别未完成，保留其它已计算表型。"
     else:
-        trait_map["flower_count"].value = int(getattr(flower_detection, "count", 0))
-        trait_map["flower_count"].unit = "count"
-        trait_map["flower_count"].status = "computed"
-        trait_map["flower_count"].message = f"{image_note}统计俯视图可见开放白花数量。"
+        if flower_detection is None:
+            trait_map["flower_count"].value = None
+            trait_map["flower_count"].unit = "count"
+            trait_map["flower_count"].status = "segmentation_failed"
+            trait_map["flower_count"].message = "花朵识别未完成，保留其它已计算表型。"
+        else:
+            trait_map["flower_count"].value = int(getattr(flower_detection, "count", 0))
+            trait_map["flower_count"].unit = "count"
+            trait_map["flower_count"].status = "computed"
+            trait_map["flower_count"].message = f"{image_note}统计俯视图可见开放白花数量。"
 
-    trait_map["flower_bud_count"].value = None
-    trait_map["flower_bud_count"].unit = "count"
-    trait_map["flower_bud_count"].status = "pending_algorithm"
-    trait_map["flower_bud_count"].message = "花骨朵识别需要 YOLOv8 模型，当前使用传统颜色检测回退。"
+        trait_map["flower_bud_count"].value = None
+        trait_map["flower_bud_count"].unit = "count"
+        trait_map["flower_bud_count"].status = "pending_algorithm"
+        trait_map["flower_bud_count"].message = "花骨朵识别需要 YOLOv8 模型，当前使用传统颜色检测回退。"
+
+        if fruit_detection is None:
+            trait_map["fruit_count"].value = None
+            trait_map["fruit_count"].unit = "count"
+            trait_map["fruit_count"].status = "segmentation_failed"
+            trait_map["fruit_count"].message = "果实识别未完成，保留其它已计算表型。"
+        else:
+            trait_map["fruit_count"].value = int(getattr(fruit_detection, "count", 0))
+            trait_map["fruit_count"].unit = "count"
+            trait_map["fruit_count"].status = "computed"
+            trait_map["fruit_count"].message = f"{image_note}统计俯视图可见成熟红果数量。"
 
     if fruit_detection is None:
-        trait_map["fruit_count"].value = None
-        trait_map["fruit_count"].unit = "count"
-        trait_map["fruit_count"].status = "segmentation_failed"
-        trait_map["fruit_count"].message = "果实识别未完成，保留其它已计算表型。"
+        trait_map["fruit_area"].value = None
+        trait_map["fruit_area"].unit = "cm^2" if is_calibrated else "px^2"
+        trait_map["fruit_area"].status = "segmentation_failed"
+        trait_map["fruit_area"].message = "果实面积提取未完成，保留其它已计算表型。"
+
+        trait_map["source_sink_ratio"].value = None
+        trait_map["source_sink_ratio"].unit = ""
+        trait_map["source_sink_ratio"].status = "segmentation_failed"
+        trait_map["source_sink_ratio"].message = "由于果实面积提取失败，源库比为空。"
+        return
+
+    fruit_mask = getattr(fruit_detection, "mask", None)
+    if not isinstance(fruit_mask, np.ndarray) or fruit_mask.ndim != 2:
+        trait_map["fruit_area"].value = None
+        trait_map["fruit_area"].unit = "cm^2" if is_calibrated else "px^2"
+        trait_map["fruit_area"].status = "segmentation_failed"
+        trait_map["fruit_area"].message = "果实面积掩膜无效，无法计算果实面积。"
+
+        trait_map["source_sink_ratio"].value = None
+        trait_map["source_sink_ratio"].unit = ""
+        trait_map["source_sink_ratio"].status = "segmentation_failed"
+        trait_map["source_sink_ratio"].message = "由于果实面积掩膜无效，源库比为空。"
+        return
+
+    fruit_area_pixels = int(np.count_nonzero(fruit_mask > 0))
+    if is_calibrated:
+        from core.calibration import pixel_area_to_cm2
+
+        fruit_area_value = round(pixel_area_to_cm2(fruit_area_pixels, float(calibration.mm_per_pixel)), 2)
+        fruit_area_unit = "cm^2"
     else:
-        trait_map["fruit_count"].value = int(getattr(fruit_detection, "count", 0))
-        trait_map["fruit_count"].unit = "count"
-        trait_map["fruit_count"].status = "computed"
-        trait_map["fruit_count"].message = f"{image_note}统计俯视图可见成熟红果数量。"
+        fruit_area_value = fruit_area_pixels
+        fruit_area_unit = "px^2"
+
+    trait_map["fruit_area"].value = fruit_area_value
+    trait_map["fruit_area"].unit = fruit_area_unit
+    trait_map["fruit_area"].status = "computed"
+    trait_map["fruit_area"].message = f"{image_note}基于可见果实掩膜统计果实投影面积。"
+
+    if float(fruit_area_value) <= 0:
+        trait_map["source_sink_ratio"].value = None
+        trait_map["source_sink_ratio"].unit = ""
+        trait_map["source_sink_ratio"].status = "computed"
+        trait_map["source_sink_ratio"].message = "未检测到可见果实面积，源库比为空。"
+        return
+
+    leaf_area_value = trait_map["leaf_area"].value
+    ratio_value = None if leaf_area_value is None else round(float(leaf_area_value) / float(fruit_area_value), 2)
+    trait_map["source_sink_ratio"].value = ratio_value
+    trait_map["source_sink_ratio"].unit = ""
+    trait_map["source_sink_ratio"].status = "computed"
+    trait_map["source_sink_ratio"].message = "源库比按叶面积除以果实面积计算。"
 
 
 def _apply_front_trait_measurements(
