@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from core.grouping import PlantImageGroup
-from core.pipeline import analyze_plant_group, create_result_rows
+from core.pipeline import _build_top_organ_filter_mask, analyze_plant_group, create_result_rows
 
 
 class FakeTopSegmentationResult:
@@ -394,6 +394,24 @@ def test_analyze_plant_group_populates_yolo_flower_bud_count() -> None:
     assert trait_map["flower_count"].value == 3
     assert trait_map["flower_bud_count"].value == 4
     assert trait_map["fruit_count"].value == 2
+
+
+def test_top_organ_filter_mask_uses_convex_hull_not_green_mask_only() -> None:
+    """YOLO organ filtering should keep flower centers inside the plant hull even if absent from the green mask."""
+
+    segmentation = FakeTopSegmentationResult(height=100, width=120)
+    segmentation.mask = np.zeros((100, 120), dtype=np.uint8)
+    segmentation.mask[44:56, 54:66] = 255
+    segmentation.convex_hull = np.array(
+        [[[20, 20]], [[100, 25]], [[95, 80]], [[25, 75]]],
+        dtype=np.int32,
+    )
+
+    organ_mask = _build_top_organ_filter_mask(segmentation)
+
+    assert organ_mask[50, 60] == 255
+    assert organ_mask[70, 80] == 255
+    assert organ_mask[5, 5] == 0
 
 
 def test_analyze_plant_group_exports_flower_and_fruit_debug_artifacts(tmp_path: Path) -> None:

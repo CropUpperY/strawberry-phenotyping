@@ -293,7 +293,8 @@ def analyze_plant_group(
 
     if top_organ_detector is not None:
         try:
-            result.top_organ_detection = top_organ_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+            organ_filter_mask = _build_top_organ_filter_mask(top_segmentation)
+            result.top_organ_detection = top_organ_detector(calibrated_images[VIEW_TOP], organ_filter_mask)
         except Exception as error:  # noqa: BLE001
             result.errors.append(f"TOP YOLO organ detection failed: {error}")
             _emit(emit_log, f"TOP YOLO organ detection failed: {error}")
@@ -499,6 +500,30 @@ def _resolve_top_organ_detector(result: PlantAnalysisResult, emit_log: LogCallba
         return None
 
     return detect_top_organs_with_yolo
+
+
+def _build_top_organ_filter_mask(top_segmentation: Any) -> np.ndarray:
+    """Build a permissive TOP organ mask so white flowers removed from green segmentation are still countable."""
+
+    import cv2  # noqa: PLC0415
+
+    raw_mask = getattr(top_segmentation, "mask", None)
+    if not isinstance(raw_mask, np.ndarray) or raw_mask.ndim != 2:
+        raise ValueError("top_segmentation.mask must be a single-channel numpy array")
+
+    organ_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+    convex_hull = getattr(top_segmentation, "convex_hull", None)
+    if isinstance(convex_hull, np.ndarray) and convex_hull.size >= 6:
+        hull_points = convex_hull.astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillConvexPoly(organ_mask, hull_points, 255)
+    else:
+        organ_mask = (raw_mask > 0).astype(np.uint8) * 255
+
+    kernel_size = max(7, int(round(min(raw_mask.shape) * 0.035)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(organ_mask, kernel, iterations=1)
 
 
 def _load_group_images(
