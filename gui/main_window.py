@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import numpy as np
@@ -44,6 +45,8 @@ from core.calibration import create_color_card_reference, pixel_area_to_cm2, pix
 from core.grouping import (
     GroupingSuggestion,
     PlantImageGroup,
+    VIEW_FRONT_0 as GROUP_VIEW_FRONT_0,
+    VIEW_TOP as GROUP_VIEW_TOP,
     collect_grouping_suggestions,
     find_incomplete_groups,
     group_image_files,
@@ -115,6 +118,12 @@ def view_paths_for_group(group: PlantImageGroup) -> dict[str, Path | None]:
         for view_name in ("TOP", "FRONT-1", "FRONT-2")
         if view_name in required_views
     }
+
+
+def is_cotton_two_view_group(group: PlantImageGroup) -> bool:
+    """Return whether the group is a cotton-style TOP + FRONT-1 sample."""
+
+    return set(group.required_views) == {GROUP_VIEW_TOP, GROUP_VIEW_FRONT_0} and group.front_180_image is None
 
 
 class ImagePreviewCard(QFrame):
@@ -1625,6 +1634,40 @@ class StrawberryMainWindow(QMainWindow):
             return None
         return self.groups[current_row]
 
+    def _build_noop_preprocess_result(self, group: PlantImageGroup) -> PreprocessResult:
+        """Build preprocessing output from original images when a sample has no color card."""
+
+        result = PreprocessResult(sample_id=group.sample_id)
+        for view_name, path in view_paths_for_group(group).items():
+            if path is None:
+                result.is_valid = False
+                result.message = f"{view_name} 图像缺失"
+                return result
+
+            image = load_image(path)
+            corrected_image = image.copy()
+            height, width = image.shape[:2]
+            result.loaded_images[view_name] = image
+            result.calibrated_images[view_name] = corrected_image
+            result.calibration_results[view_name] = SimpleNamespace(
+                status="skipped",
+                message=f"{view_name} 棉花样本无色卡，已跳过色卡校正并使用原图。",
+                view_name=view_name,
+                corrected_image=corrected_image,
+                corrected_card=None,
+                warped_card=None,
+                mm_per_pixel=None,
+                pixels_per_mm=None,
+                search_region=(0, 0, width, height),
+                debug_images={},
+                is_calibrated=False,
+            )
+            result.debug_images[view_name] = {}
+
+        result.is_valid = True
+        result.message = "棉花样本无色卡，已跳过色卡选择与颜色校正，直接使用原图。"
+        return result
+
     def _handle_preprocess(self) -> None:
         """执行色卡预处理：色卡定位、颜色校正和尺度标定。"""
         if self.preprocess_thread is not None and self.preprocess_thread.isRunning():
@@ -1633,6 +1676,16 @@ class StrawberryMainWindow(QMainWindow):
         group = self._selected_group()
         if group is None:
             QMessageBox.information(self, "提示", "请先选择一个样本组。")
+            return
+
+        if is_cotton_two_view_group(group):
+            self._append_log(f"棉花样本 {group.sample_id} 无色卡，跳过色卡选择与颜色校正，直接使用原图。")
+            try:
+                result = self._build_noop_preprocess_result(group)
+            except Exception as error:  # noqa: BLE001
+                QMessageBox.warning(self, "预处理失败", f"棉花样本原图读取失败: {error}")
+                return
+            self._on_preprocess_finished(result)
             return
 
         if self.color_card_regions is None:
@@ -1712,6 +1765,17 @@ class StrawberryMainWindow(QMainWindow):
             return
 
         # 检查是否已完成预处理
+        if (
+            (self.preprocess_result is None or self.preprocess_result.sample_id != group.sample_id)
+            and is_cotton_two_view_group(group)
+        ):
+            self._append_log(f"棉花样本 {group.sample_id} 未做色卡预处理，直接使用原图进行表型提取。")
+            try:
+                self.preprocess_result = self._build_noop_preprocess_result(group)
+            except Exception as error:  # noqa: BLE001
+                QMessageBox.warning(self, "分析失败", f"棉花样本原图读取失败: {error}")
+                return
+
         if self.preprocess_result is None or self.preprocess_result.sample_id != group.sample_id:
             QMessageBox.warning(
                 self, "未完成预处理",
@@ -1810,7 +1874,7 @@ class StrawberryMainWindow(QMainWindow):
             return
 
         # 检查是否已完成预处理
-        if self.color_card_regions is None:
+        if self.color_card_regions is None and not all(is_cotton_two_view_group(group) for group in self.groups):
             QMessageBox.warning(
                 self, "未完成预处理",
                 '请先完成色卡预处理步骤：\n\n'

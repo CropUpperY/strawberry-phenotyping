@@ -197,6 +197,87 @@ def test_select_color_card_regions_skips_missing_optional_front_view(
     window.close()
 
 
+def test_cotton_preprocess_uses_original_images_without_color_card(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cotton samples have no color card, so preprocessing should be a no-op."""
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(StrawberryMainWindow, "_load_groups", lambda self, directory: None)
+
+    window = StrawberryMainWindow()
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=tmp_path / "top.jpg",
+        front_0_image=tmp_path / "front.jpg",
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+
+    image_by_name = {
+        "top.jpg": np.full((8, 8, 3), 40, dtype=np.uint8),
+        "front.jpg": np.full((8, 8, 3), 90, dtype=np.uint8),
+    }
+
+    def fake_load_image(path: Path) -> np.ndarray:
+        return image_by_name[path.name].copy()
+
+    monkeypatch.setattr(main_window_module, "load_image", fake_load_image)
+
+    result = window._build_noop_preprocess_result(group)
+
+    assert result.is_valid
+    assert set(result.loaded_images) == {"TOP", "FRONT-1"}
+    assert set(result.calibrated_images) == {"TOP", "FRONT-1"}
+    assert np.array_equal(result.calibrated_images["TOP"], image_by_name["top.jpg"])
+    assert np.array_equal(result.calibrated_images["FRONT-1"], image_by_name["front.jpg"])
+    assert all(not item.is_calibrated for item in result.calibration_results.values())
+    assert "无色卡" in result.message
+    window.close()
+
+
+def test_cotton_preprocess_button_does_not_require_color_card(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking preprocess for cotton should not show the color-card warning."""
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(StrawberryMainWindow, "_load_groups", lambda self, directory: None)
+
+    window = StrawberryMainWindow()
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=tmp_path / "top.jpg",
+        front_0_image=tmp_path / "front.jpg",
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+    window.groups = [group]
+    image = np.full((8, 8, 3), 80, dtype=np.uint8)
+
+    warnings: list[tuple[str, str]] = []
+    finished_results: list[PreprocessResult] = []
+
+    monkeypatch.setattr(window, "_selected_group", lambda: group)
+    monkeypatch.setattr(main_window_module, "load_image", lambda path: image.copy())
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+    monkeypatch.setattr(window, "_on_preprocess_finished", lambda result: finished_results.append(result))
+
+    window.color_card_regions = None
+    window._handle_preprocess()
+
+    assert warnings == []
+    assert len(finished_results) == 1
+    assert finished_results[0].is_valid
+    window.close()
+
+
 def test_preprocess_runtime_visualizations_are_downsampled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -223,9 +223,11 @@ def analyze_plant_group(
     if front_segmenter is None:
         return result
 
-    image_calibrator = image_calibrator or _resolve_image_calibrator(result, emit_log)
-    if image_calibrator is None:
-        return result
+    needs_color_calibration = precomputed_calibration is None and not _is_cotton_two_view_group(group)
+    if needs_color_calibration:
+        image_calibrator = image_calibrator or _resolve_image_calibrator(result, emit_log)
+        if image_calibrator is None:
+            return result
 
     top_organ_detector = top_organ_detector or (
         None if has_injected_components else _resolve_top_organ_detector(result, emit_log)
@@ -257,14 +259,21 @@ def analyze_plant_group(
         if loaded_images is None:
             return result
 
-        calibrated_images = _calibrate_group_images(
-            loaded_images,
-            result=result,
-            emit_log=emit_log,
-            image_calibrator=image_calibrator,
-            calibration_reference=calibration_reference,
-            manual_regions=manual_color_card_regions,
-        )
+        if _is_cotton_two_view_group(group):
+            calibrated_images = _use_original_images_without_calibration(
+                loaded_images,
+                result=result,
+                emit_log=emit_log,
+            )
+        else:
+            calibrated_images = _calibrate_group_images(
+                loaded_images,
+                result=result,
+                emit_log=emit_log,
+                image_calibrator=image_calibrator,
+                calibration_reference=calibration_reference,
+                manual_regions=manual_color_card_regions,
+            )
 
     _emit(emit_log, "开始执行 TOP 俯视图分割")
     top_segmentation = _run_segmentation_step(
@@ -443,6 +452,12 @@ def _analysis_views_for_group(group: PlantImageGroup) -> tuple[str, ...]:
     return tuple(view for view in VIEW_SEQUENCE if view in views)
 
 
+def _is_cotton_two_view_group(group: PlantImageGroup) -> bool:
+    """Return whether the group is the cotton two-view layout without FRONT-2."""
+
+    return set(group.required_views) == {GROUP_VIEW_TOP, GROUP_VIEW_FRONT_0} and group.front_180_image is None
+
+
 def _build_initial_view_results(group: PlantImageGroup) -> dict[str, ViewLoadResult]:
     """Build initial missing-state view records for the views this group requires."""
 
@@ -473,7 +488,7 @@ def _front_views_for_result(result: PlantAnalysisResult) -> tuple[str, ...]:
 def _top_segmentation_kwargs_for_group(group: PlantImageGroup) -> dict[str, str]:
     """Return TOP segmentation options for plant-specific profiles."""
 
-    if set(group.required_views) == {GROUP_VIEW_TOP, GROUP_VIEW_FRONT_0} and group.front_180_image is None:
+    if _is_cotton_two_view_group(group):
         return {"profile": "cotton"}
     return {}
 
@@ -721,6 +736,27 @@ def _calibrate_group_images(
         else:
             _emit(emit_log, getattr(calibration, "message", f"{view_name} 未完成色卡校正，已使用原图继续分析。"))
 
+    return calibrated_images
+
+
+def _use_original_images_without_calibration(
+    loaded_images: dict[str, Any],
+    *,
+    result: PlantAnalysisResult,
+    emit_log: LogCallback | None,
+) -> dict[str, Any]:
+    """Use original cotton images directly because cotton samples have no color card."""
+
+    calibrated_images: dict[str, Any] = {}
+    for view_name, image in loaded_images.items():
+        calibration = _fallback_calibration_result(
+            image,
+            view_name=view_name,
+            message=f"{view_name} 棉花样本无色卡，已跳过色卡校正并使用原图。",
+        )
+        result.calibration_results[view_name] = calibration
+        calibrated_images[view_name] = image
+        _emit(emit_log, calibration.message)
     return calibrated_images
 
 

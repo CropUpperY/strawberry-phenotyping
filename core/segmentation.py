@@ -685,9 +685,11 @@ def _filter_cotton_top_view_mask(
             "cotton_base_leaf_mask": empty,
             "cotton_strong_leaf_seed_mask": empty,
             "cotton_soil_removed_mask": empty,
+            "cotton_internal_hole_mask": empty,
             "cotton_far_component_removed_mask": empty,
             "cotton_component_kept_mask": empty,
             "cotton_soil_filtered_mask": empty,
+            "cotton_hole_filled_mask": empty,
             "cotton_weak_green_mask": empty,
             "cotton_recovered_weak_green_mask": empty,
             "cotton_weak_green_search_region": empty,
@@ -696,17 +698,22 @@ def _filter_cotton_top_view_mask(
     augmented_mask, weak_debug = _augment_cotton_top_mask_with_nearby_weak_green_regions(image, mask)
     component_mask, far_removed_mask = _filter_cotton_top_components(augmented_mask)
     filtered_mask, soil_removed_mask = _remove_cotton_top_soil_like_pixels(soil_color_image, component_mask)
+    gap_closed_mask = _close_cotton_top_leaf_edge_gaps(filtered_mask)
+    hole_filled_mask, internal_hole_mask = _fill_cotton_top_internal_holes(gap_closed_mask)
     debug_images = {
         "cotton_base_leaf_mask": mask.copy(),
         # Kept for backward-compatible debug displays; cotton no longer uses a strong-green seed.
         "cotton_strong_leaf_seed_mask": mask.copy(),
         "cotton_soil_removed_mask": soil_removed_mask,
+        "cotton_internal_hole_mask": internal_hole_mask,
         "cotton_far_component_removed_mask": far_removed_mask,
         "cotton_component_kept_mask": component_mask.copy(),
         "cotton_soil_filtered_mask": filtered_mask.copy(),
+        "cotton_gap_closed_mask": gap_closed_mask.copy(),
+        "cotton_hole_filled_mask": hole_filled_mask.copy(),
     }
     debug_images.update(weak_debug)
-    return filtered_mask, debug_images
+    return hole_filled_mask, debug_images
 
 
 def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -759,6 +766,41 @@ def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> 
     soil_mask = cv2.morphologyEx(soil_mask, cv2.MORPH_OPEN, kernel)
     filtered_mask = cv2.subtract(mask, soil_mask)
     return filtered_mask, soil_mask
+
+
+def _fill_cotton_top_internal_holes(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Fill enclosed black holes inside cotton TOP leaves/components."""
+
+    empty = np.zeros_like(mask)
+    if cv2.countNonZero(mask) == 0:
+        return mask, empty
+
+    binary_mask = ((mask > 0).astype(np.uint8)) * 255
+    height, width = binary_mask.shape
+    inverted = cv2.bitwise_not(binary_mask)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(inverted, connectivity=8)
+
+    filled_mask = binary_mask.copy()
+    hole_mask = np.zeros_like(binary_mask)
+    for component_index in range(1, component_count):
+        x = int(stats[component_index, cv2.CC_STAT_LEFT])
+        y = int(stats[component_index, cv2.CC_STAT_TOP])
+        width_px = int(stats[component_index, cv2.CC_STAT_WIDTH])
+        height_px = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+        touches_border = (
+            x == 0
+            or y == 0
+            or x + width_px >= width
+            or y + height_px >= height
+        )
+        if touches_border:
+            continue
+
+        component_pixels = labels == component_index
+        filled_mask[component_pixels] = 255
+        hole_mask[component_pixels] = 255
+
+    return filled_mask, hole_mask
 
 
 def _augment_cotton_top_mask_with_nearby_weak_green_regions(

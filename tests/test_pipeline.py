@@ -182,12 +182,46 @@ def test_analyze_plant_group_computes_traits_for_two_view_cotton_group() -> None
     image = np.zeros((32, 48, 3), dtype=np.uint8)
     image[:, :, 1] = 120
 
+    result = analyze_plant_group(
+        group,
+        emit_log=lambda _: None,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: FakeFrontSegmentationResult(height=90, width=45, mask_area=2400),
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert result.status == "analysis_complete"
+    assert "FRONT-2" not in result.view_results
+    assert result.front_segmentations.keys() == {"FRONT-1"}
+    assert trait_map["canopy_height"].unit == "px"
+    assert trait_map["canopy_height"].value == 90
+    assert trait_map["side_projection_area"].unit == "px^2"
+    assert trait_map["side_projection_area"].value == 2400
+
+
+def test_analyze_plant_group_skips_calibration_for_two_view_cotton_group() -> None:
+    """Cotton groups have no color card, so pipeline analysis should use originals."""
+
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=Path("data/cotton/top/cotton-1.jpg"),
+        front_0_image=Path("data/cotton/front/cotton-1.jpg"),
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+    image = np.zeros((32, 48, 3), dtype=np.uint8)
+    image[:, :, 1] = 120
+    calibration_calls: list[str] = []
+
     def calibrator(payload: np.ndarray, *, view_name: str) -> SimpleNamespace:
+        calibration_calls.append(view_name)
         return _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2)
 
     result = analyze_plant_group(
         group,
-        emit_log=lambda _: None,
         image_loader=lambda _: image.copy(),
         top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
         front_segmenter=lambda _: FakeFrontSegmentationResult(height=90, width=45, mask_area=2400),
@@ -198,10 +232,10 @@ def test_analyze_plant_group_computes_traits_for_two_view_cotton_group() -> None
     trait_map = result.trait_map()
 
     assert result.status == "analysis_complete"
-    assert "FRONT-2" not in result.view_results
-    assert result.front_segmentations.keys() == {"FRONT-1"}
-    assert trait_map["canopy_height"].value == 1.8
-    assert trait_map["side_projection_area"].value == 0.96
+    assert calibration_calls == []
+    assert all(not item.is_calibrated for item in result.calibration_results.values())
+    assert trait_map["canopy_height"].unit == "px"
+    assert trait_map["side_projection_area"].unit == "px^2"
 
 
 def test_analyze_plant_group_uses_cotton_top_profile_for_two_view_group() -> None:
