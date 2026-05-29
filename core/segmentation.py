@@ -689,6 +689,7 @@ def _filter_cotton_top_view_mask(
             "cotton_far_component_removed_mask": empty,
             "cotton_component_kept_mask": empty,
             "cotton_soil_filtered_mask": empty,
+            "cotton_gap_closed_mask": empty,
             "cotton_hole_filled_mask": empty,
             "cotton_weak_green_mask": empty,
             "cotton_recovered_weak_green_mask": empty,
@@ -742,13 +743,21 @@ def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> 
     local_std = np.sqrt(np.maximum(gray_mean_sq - gray_mean * gray_mean, 0.0))
 
     leaf_protected = (
-        (green_excess >= 22.0)
-        | ((hue >= 55.0) & (hue <= 95.0) & (saturation >= 35.0) & (green_excess >= 16.0))
-        | ((green_minus_red >= 24.0) & (green_minus_blue >= 22.0))
+        (green_excess >= 14.0)
+        | ((hue >= 45.0) & (hue <= 105.0) & (saturation >= 18.0) & (green_excess >= 6.0))
+        | ((green_minus_red >= 12.0) & (green_minus_blue >= 10.0))
+        | ((hue >= 28.0) & (hue <= 70.0) & (value >= 70.0) & (local_std <= 28.0))
     )
-    granular_soil = (saturation >= 65.0) & (green_excess <= 18.0) & (local_std >= 12.0)
-    pale_soil = (saturation <= 50.0) & (green_excess <= 18.0) & (green_minus_blue <= 34.0)
-    brown_soil = (red_minus_blue >= 32.0) & (green_excess <= 12.0) & (local_std >= 14.0)
+    stem_protected = (
+        (hue >= 18.0)
+        & (hue <= 58.0)
+        & (value >= 85.0)
+        & (green_minus_blue >= 12.0)
+        & (local_std <= 35.0)
+    )
+    granular_soil = (saturation >= 85.0) & (green_excess <= 10.0) & (local_std >= 18.0)
+    pale_soil = (saturation <= 38.0) & (green_excess <= 8.0) & (green_minus_blue <= 18.0) & (local_std >= 18.0)
+    brown_soil = (red_minus_blue >= 42.0) & (green_excess <= 6.0) & (local_std >= 18.0)
     soil_colored = (
         (mask > 0)
         & (hue >= 18.0)
@@ -758,6 +767,7 @@ def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> 
         & (value >= 45.0)
         & (granular_soil | pale_soil | brown_soil)
         & (~leaf_protected)
+        & (~stem_protected)
     )
 
     soil_mask = soil_colored.astype(np.uint8) * 255
@@ -766,6 +776,19 @@ def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> 
     soil_mask = cv2.morphologyEx(soil_mask, cv2.MORPH_OPEN, kernel)
     filtered_mask = cv2.subtract(mask, soil_mask)
     return filtered_mask, soil_mask
+
+
+def _close_cotton_top_leaf_edge_gaps(mask: np.ndarray) -> np.ndarray:
+    """Close small edge gaps in cotton TOP leaves without changing the outer background."""
+
+    if cv2.countNonZero(mask) == 0:
+        return mask
+
+    image_height, image_width = mask.shape
+    kernel_size = _make_odd(max(5, int(round(min(image_height, image_width) * 0.012))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return _filter_cotton_top_components(closed)[0]
 
 
 def _fill_cotton_top_internal_holes(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
