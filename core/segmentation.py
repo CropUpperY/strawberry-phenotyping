@@ -76,13 +76,21 @@ def segment_top_view_plant(
     prepared["top_band_candidate_mask"] = top_band_candidate
     prepared["removed_top_pot_band"] = removed_top_band
     if profile == "cotton":
-        filtered_mask, cotton_debug = _filter_cotton_top_view_mask(prepared["denoised"], filtered_mask)
+        filtered_mask, cotton_debug = _filter_cotton_top_view_mask(
+            prepared["denoised"],
+            prepared["original"],
+            filtered_mask,
+        )
         prepared.update(cotton_debug)
     leaf_mask = filtered_mask
-    plant_mask, reproductive_debug = _augment_top_mask_with_reproductive_organs(
-        prepared["denoised"],
-        leaf_mask,
-    )
+    if profile == "cotton":
+        plant_mask = leaf_mask.copy()
+        reproductive_debug = _empty_top_reproductive_debug(leaf_mask)
+    else:
+        plant_mask, reproductive_debug = _augment_top_mask_with_reproductive_organs(
+            prepared["denoised"],
+            leaf_mask,
+        )
     prepared.update(reproductive_debug)
     prepared["leaf_mask"] = leaf_mask
     prepared["filtered_mask"] = plant_mask
@@ -664,57 +672,158 @@ def _filter_top_view_components(mask: np.ndarray) -> np.ndarray:
     return filtered_mask
 
 
-def _filter_cotton_top_view_mask(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Remove pot soil and distant greenish noise from cotton TOP-view masks."""
+def _filter_cotton_top_view_mask(
+    image: np.ndarray,
+    soil_color_image: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Keep cotton TOP leaves conservatively and remove only distant isolated components."""
 
     empty = np.zeros_like(mask)
     if cv2.countNonZero(mask) == 0:
         return mask, {
+            "cotton_base_leaf_mask": empty,
             "cotton_strong_leaf_seed_mask": empty,
             "cotton_soil_removed_mask": empty,
             "cotton_far_component_removed_mask": empty,
+            "cotton_component_kept_mask": empty,
+            "cotton_soil_filtered_mask": empty,
+            "cotton_weak_green_mask": empty,
+            "cotton_recovered_weak_green_mask": empty,
+            "cotton_weak_green_search_region": empty,
         }
 
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    augmented_mask, weak_debug = _augment_cotton_top_mask_with_nearby_weak_green_regions(image, mask)
+    component_mask, far_removed_mask = _filter_cotton_top_components(augmented_mask)
+    filtered_mask, soil_removed_mask = _remove_cotton_top_soil_like_pixels(soil_color_image, component_mask)
+    debug_images = {
+        "cotton_base_leaf_mask": mask.copy(),
+        # Kept for backward-compatible debug displays; cotton no longer uses a strong-green seed.
+        "cotton_strong_leaf_seed_mask": mask.copy(),
+        "cotton_soil_removed_mask": soil_removed_mask,
+        "cotton_far_component_removed_mask": far_removed_mask,
+        "cotton_component_kept_mask": component_mask.copy(),
+        "cotton_soil_filtered_mask": filtered_mask.copy(),
+    }
+    debug_images.update(weak_debug)
+    return filtered_mask, debug_images
+
+
+def _remove_cotton_top_soil_like_pixels(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Remove yellow-brown cotton pot soil while protecting gray-green leaf pixels."""
+
+    empty = np.zeros_like(mask)
+    if cv2.countNonZero(mask) == 0:
+        return mask, empty
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
     bgr = image.astype(np.float32)
-    green_excess = bgr[:, :, 1] - np.maximum(bgr[:, :, 0], bgr[:, :, 2])
-    strong_leaf = (
-        (mask > 0)
-        & (hsv[:, :, 0] >= 28)
-        & (hsv[:, :, 0] <= 92)
-        & (hsv[:, :, 1] >= 45)
-        & (hsv[:, :, 2] >= 45)
-        & (green_excess >= 32.0)
-    ).astype(np.uint8) * 255
+    b_channel = bgr[:, :, 0]
+    g_channel = bgr[:, :, 1]
+    r_channel = bgr[:, :, 2]
+    green_excess = g_channel - np.maximum(b_channel, r_channel)
+    green_minus_red = g_channel - r_channel
+    green_minus_blue = g_channel - b_channel
+    red_minus_blue = r_channel - b_channel
 
-    if cv2.countNonZero(strong_leaf) == 0:
-        return mask, {
-            "cotton_strong_leaf_seed_mask": strong_leaf,
-            "cotton_soil_removed_mask": empty,
-            "cotton_far_component_removed_mask": empty,
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray_mean = cv2.blur(gray, (11, 11))
+    gray_mean_sq = cv2.blur(gray * gray, (11, 11))
+    local_std = np.sqrt(np.maximum(gray_mean_sq - gray_mean * gray_mean, 0.0))
+
+    leaf_protected = (
+        (green_excess >= 22.0)
+        | ((hue >= 55.0) & (hue <= 95.0) & (saturation >= 35.0) & (green_excess >= 16.0))
+        | ((green_minus_red >= 24.0) & (green_minus_blue >= 22.0))
+    )
+    granular_soil = (saturation >= 65.0) & (green_excess <= 18.0) & (local_std >= 12.0)
+    pale_soil = (saturation <= 50.0) & (green_excess <= 18.0) & (green_minus_blue <= 34.0)
+    brown_soil = (red_minus_blue >= 32.0) & (green_excess <= 12.0) & (local_std >= 14.0)
+    soil_colored = (
+        (mask > 0)
+        & (hue >= 18.0)
+        & (hue <= 55.0)
+        & (saturation >= 18.0)
+        & (saturation <= 175.0)
+        & (value >= 45.0)
+        & (granular_soil | pale_soil | brown_soil)
+        & (~leaf_protected)
+    )
+
+    soil_mask = soil_colored.astype(np.uint8) * 255
+    open_size = _make_odd(max(3, int(round(min(mask.shape) * 0.004))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size))
+    soil_mask = cv2.morphologyEx(soil_mask, cv2.MORPH_OPEN, kernel)
+    filtered_mask = cv2.subtract(mask, soil_mask)
+    return filtered_mask, soil_mask
+
+
+def _augment_cotton_top_mask_with_nearby_weak_green_regions(
+    image: np.ndarray,
+    strong_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Recover only weak green cotton TOP pixels adjacent to the existing plant mask."""
+
+    empty = np.zeros_like(strong_mask)
+    hsv_green_mask = _build_hsv_green_mask(image)
+    green_dominance_mask = _build_green_dominance_mask(image)
+    weak_green_mask = cv2.bitwise_and(hsv_green_mask, cv2.bitwise_not(green_dominance_mask))
+    weak_green_mask = cv2.bitwise_and(weak_green_mask, cv2.bitwise_not(strong_mask))
+
+    if cv2.countNonZero(strong_mask) == 0 or cv2.countNonZero(weak_green_mask) == 0:
+        return strong_mask, {
+            "cotton_weak_green_mask": weak_green_mask,
+            "cotton_recovered_weak_green_mask": empty,
+            "cotton_weak_green_search_region": empty,
         }
 
-    soil_like = (
-        (mask > 0)
-        & ((green_excess < 28.0) | ((hsv[:, :, 1] < 55) & (green_excess < 36.0)))
-    ).astype(np.uint8) * 255
-    soil_like = _filter_small_components(soil_like, min_component_area_ratio=0.00012)
-    filtered_mask = cv2.subtract(mask, soil_like)
+    image_height, image_width = strong_mask.shape
+    search_size = _make_odd(max(7, int(round(min(image_height, image_width) * 0.035))))
+    search_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (search_size, search_size))
+    search_region = cv2.dilate(strong_mask, search_kernel, iterations=1)
+    nearby_weak_green = cv2.bitwise_and(weak_green_mask, search_region)
+    nearby_weak_green = _filter_small_components(nearby_weak_green, min_component_area_ratio=0.00006)
+
+    augmented_mask = cv2.bitwise_or(strong_mask, nearby_weak_green)
+    return augmented_mask, {
+        "cotton_weak_green_mask": weak_green_mask,
+        "cotton_recovered_weak_green_mask": nearby_weak_green,
+        "cotton_weak_green_search_region": search_region,
+    }
+
+
+def _filter_cotton_top_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the main cotton TOP plant body plus nearby satellite leaf components."""
+
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    empty = np.zeros_like(mask)
+    if component_count <= 1:
+        return mask, empty
 
     image_height, image_width = mask.shape
-    seed_size = _make_odd(max(9, int(round(min(image_height, image_width) * 0.045))))
-    seed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seed_size, seed_size))
-    strong_seed_region = cv2.dilate(strong_leaf, seed_kernel, iterations=1)
-
-    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(filtered_mask, connectivity=8)
-    kept_mask = np.zeros_like(mask)
+    image_area = image_height * image_width
+    min_area_pixels = max(48, int(image_area * 0.00025))
+    candidate_indices: list[int] = []
     far_removed_mask = np.zeros_like(mask)
-    min_area_pixels = max(48, int(image_height * image_width * 0.00025))
+
+    for component_index in range(1, component_count):
+        component_mask = labels == component_index
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        if area < min_area_pixels:
+            far_removed_mask[component_mask] = 255
+            continue
+        candidate_indices.append(component_index)
+
+    if not candidate_indices:
+        return empty, mask.copy()
+
     main_component_index = _select_cotton_top_main_component(
-        labels,
         stats,
         centroids,
-        strong_leaf,
+        candidate_indices,
         image_width,
         image_height,
     )
@@ -723,63 +832,59 @@ def _filter_cotton_top_view_mask(image: np.ndarray, mask: np.ndarray) -> tuple[n
         int(stats[main_component_index, cv2.CC_STAT_TOP]),
         int(stats[main_component_index, cv2.CC_STAT_WIDTH]),
         int(stats[main_component_index, cv2.CC_STAT_HEIGHT]),
-    ) if main_component_index is not None else None
+    )
+    main_area = int(stats[main_component_index, cv2.CC_STAT_AREA])
 
-    for component_index in range(1, component_count):
+    kept_mask = np.zeros_like(mask)
+    for component_index in candidate_indices:
         component_mask = labels == component_index
-        component_area = int(stats[component_index, cv2.CC_STAT_AREA])
-        overlaps_leaf_seed = cv2.countNonZero(cv2.bitwise_and((component_mask.astype(np.uint8) * 255), strong_seed_region)) > 0
-        near_main = main_box is not None and _is_cotton_top_near_main_component(
+        if component_index == main_component_index or _is_cotton_top_related_component(
             stats[component_index],
             main_box,
+            main_area,
             image_width,
             image_height,
-        )
-        if component_index == main_component_index or (near_main and overlaps_leaf_seed) or component_area < min_area_pixels:
+        ):
             kept_mask[component_mask] = 255
         else:
             far_removed_mask[component_mask] = 255
 
-    return kept_mask, {
-        "cotton_strong_leaf_seed_mask": strong_leaf,
-        "cotton_soil_removed_mask": cv2.bitwise_and(mask, soil_like),
-        "cotton_far_component_removed_mask": far_removed_mask,
-    }
+    return kept_mask, far_removed_mask
 
 
 def _select_cotton_top_main_component(
-    labels: np.ndarray,
     stats: np.ndarray,
     centroids: np.ndarray,
-    strong_leaf: np.ndarray,
+    candidate_indices: list[int],
     image_width: int,
     image_height: int,
-) -> int | None:
+) -> int:
     """Pick the cotton TOP component most likely to be the plant body."""
 
-    component_count = stats.shape[0]
+    interior_indices = [
+        component_index
+        for component_index in candidate_indices
+        if not _component_touches_image_border(stats[component_index], image_width, image_height)
+    ]
+    scoring_indices = interior_indices if interior_indices else candidate_indices
     image_center_x = image_width / 2.0
     image_center_y = image_height / 2.0
-    best_index: int | None = None
+    best_index = scoring_indices[0]
     best_score = float("-inf")
 
-    for component_index in range(1, component_count):
-        component_mask = (labels == component_index).astype(np.uint8) * 255
-        leaf_overlap = cv2.countNonZero(cv2.bitwise_and(component_mask, strong_leaf))
-        if leaf_overlap == 0:
-            continue
-
+    for component_index in scoring_indices:
         area = float(stats[component_index, cv2.CC_STAT_AREA])
         width = float(stats[component_index, cv2.CC_STAT_WIDTH])
-        height = float(stats[component_index, cv2.CC_STAT_HEIGHT])
         center_x = float(centroids[component_index, 0])
         center_y = float(centroids[component_index, 1])
         distance_penalty = (
             abs(center_x - image_center_x) / max(image_width, 1)
             + abs(center_y - image_center_y) / max(image_height, 1)
         )
-        aspect_penalty = abs(np.log(max(height / max(width, 1.0), 0.01)))
-        score = leaf_overlap + area * 0.12 - area * distance_penalty - area * aspect_penalty * 0.08
+        score = area * (1.0 - min(distance_penalty, 1.0) * 0.35)
+        if center_x > image_width * 0.82 and width < image_width * 0.20:
+            score *= 0.35
+
         if score > best_score:
             best_score = score
             best_index = component_index
@@ -787,24 +892,49 @@ def _select_cotton_top_main_component(
     return best_index
 
 
-def _is_cotton_top_near_main_component(
-    stats_row: np.ndarray,
-    main_box: tuple[int, int, int, int],
-    image_width: int,
-    image_height: int,
-) -> bool:
-    """Return whether a TOP component is close enough to belong to the cotton plant."""
+def _component_touches_image_border(stats_row: np.ndarray, image_width: int, image_height: int) -> bool:
+    """Return whether a component touches the frame edge, which is background-like in cotton TOP images."""
 
     x = int(stats_row[cv2.CC_STAT_LEFT])
     y = int(stats_row[cv2.CC_STAT_TOP])
     width = int(stats_row[cv2.CC_STAT_WIDTH])
     height = int(stats_row[cv2.CC_STAT_HEIGHT])
+    return x <= 0 or y <= 0 or x + width >= image_width or y + height >= image_height
+
+
+def _is_cotton_top_related_component(
+    stats_row: np.ndarray,
+    main_box: tuple[int, int, int, int],
+    main_area: int,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    """Return whether a TOP component is spatially related to the cotton plant body."""
+
+    x = int(stats_row[cv2.CC_STAT_LEFT])
+    y = int(stats_row[cv2.CC_STAT_TOP])
+    width = int(stats_row[cv2.CC_STAT_WIDTH])
+    height = int(stats_row[cv2.CC_STAT_HEIGHT])
+    area = int(stats_row[cv2.CC_STAT_AREA])
     main_x, main_y, main_width, main_height = main_box
     main_right = main_x + main_width
     main_bottom = main_y + main_height
     horizontal_gap = max(main_x - (x + width), x - main_right, 0)
     vertical_gap = max(main_y - (y + height), y - main_bottom, 0)
-    return horizontal_gap <= image_width * 0.10 and vertical_gap <= image_height * 0.10
+    horizontally_near = horizontal_gap <= image_width * 0.12
+    vertically_near = vertical_gap <= image_height * 0.12
+    if horizontally_near and vertically_near:
+        return True
+    if _component_touches_image_border(stats_row, image_width, image_height):
+        return False
+
+    component_center_x = x + width / 2.0
+    component_center_y = y + height / 2.0
+    center_distance = (
+        abs(component_center_x - (main_x + main_width / 2.0)) / max(image_width, 1)
+        + abs(component_center_y - (main_y + main_height / 2.0)) / max(image_height, 1)
+    )
+    return area >= main_area * 0.20 and center_distance <= 0.34
 
 
 def _augment_top_mask_with_reproductive_organs(
@@ -828,6 +958,17 @@ def _augment_top_mask_with_reproductive_organs(
         "top_reproductive_allowed_region": allowed_region,
         "top_reproductive_candidate_mask": candidate_mask,
         "top_reproductive_mask": reproductive_mask,
+    }
+
+
+def _empty_top_reproductive_debug(mask: np.ndarray) -> dict[str, np.ndarray]:
+    """Return empty TOP reproductive debug masks for profiles that should not recover them."""
+
+    empty = np.zeros_like(mask)
+    return {
+        "top_reproductive_allowed_region": empty,
+        "top_reproductive_candidate_mask": empty,
+        "top_reproductive_mask": empty,
     }
 
 

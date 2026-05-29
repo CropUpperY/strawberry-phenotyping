@@ -85,27 +85,54 @@ def test_segment_top_view_plant_preserves_white_flowers_inside_canopy() -> None:
     assert cv2.countNonZero(result.debug_images["top_reproductive_mask"]) > 0
 
 
-def test_segment_top_view_plant_cotton_profile_removes_soil_and_far_noise() -> None:
-    """Cotton TOP segmentation should remove pot soil and distant greenish noise."""
+def test_segment_top_view_plant_cotton_profile_keeps_low_saturation_leaves() -> None:
+    """Cotton TOP segmentation should not discard broad gray-green cotton leaves."""
 
     image = np.zeros((360, 460, 3), dtype=np.uint8)
-    cv2.rectangle(image, (150, 160), (268, 255), (58, 78, 66), -1)
+    cv2.rectangle(image, (155, 230), (272, 270), (165, 190, 175), -1)
     cv2.rectangle(image, (388, 110), (442, 286), (42, 82, 58), -1)
-    cv2.circle(image, (175, 132), 36, (30, 178, 44), -1)
-    cv2.circle(image, (242, 126), 34, (28, 170, 42), -1)
-    cv2.circle(image, (205, 184), 34, (34, 165, 48), -1)
+    cv2.circle(image, (185, 145), 52, (118, 142, 116), -1)
+    cv2.circle(image, (248, 138), 46, (112, 138, 108), -1)
+    cv2.circle(image, (210, 205), 42, (34, 165, 48), -1)
 
     result = segment_top_view_plant(image, profile="cotton")
 
     assert result.status == "segmented"
-    assert result.mask[132, 175] == 255
-    assert result.mask[184, 205] == 255
-    assert result.mask[240, 210] == 0
+    assert result.leaf_mask is not None
+    assert result.leaf_mask[145, 185] == 255
+    assert result.leaf_mask[138, 248] == 255
+    assert result.leaf_mask[205, 210] == 255
+    assert result.mask[145, 185] == 255
+    assert result.mask[138, 248] == 255
+    assert result.mask[205, 210] == 255
+    assert result.leaf_mask[260, 210] == 0
     assert result.mask[198, 420] == 0
     assert cv2.countNonZero(result.debug_images["cotton_soil_removed_mask"]) > 0
     assert cv2.countNonZero(result.debug_images["cotton_far_component_removed_mask"]) > 0
     x, _y, width, _height = result.bounding_box
     assert x + width < 320
+
+
+def test_segment_top_view_plant_cotton_profile_removes_soil_color_without_refill() -> None:
+    """Cotton TOP segmentation should remove pale soil colors and not add them back."""
+
+    image = np.zeros((280, 360, 3), dtype=np.uint8)
+    cv2.circle(image, (140, 110), 50, (118, 142, 116), -1)
+    cv2.circle(image, (220, 110), 48, (112, 138, 108), -1)
+    cv2.circle(image, (180, 185), 46, (34, 165, 48), -1)
+    cv2.rectangle(image, (150, 132), (220, 182), (165, 190, 175), -1)
+
+    result = segment_top_view_plant(image, profile="cotton")
+
+    assert result.status == "segmented"
+    assert result.leaf_mask is not None
+    assert result.leaf_mask[110, 140] == 255
+    assert result.leaf_mask[110, 220] == 255
+    assert result.leaf_mask[185, 180] == 255
+    assert result.leaf_mask[156, 185] == 0
+    assert result.mask[156, 185] == 0
+    assert cv2.countNonZero(result.debug_images["cotton_soil_removed_mask"]) > 0
+    assert cv2.countNonZero(result.debug_images["top_reproductive_mask"]) == 0
 
 
 def test_segment_top_view_plant_handles_empty_foreground() -> None:
