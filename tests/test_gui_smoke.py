@@ -13,17 +13,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PyQt5")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QGroupBox
 from PyQt5.QtGui import QColor, QPixmap
 
 from core.batch_processor import BatchAnalysisReport, BatchSampleResult
 from core.grouping import GroupingSuggestion
 from core.grouping import PlantImageGroup
+from core.grouping import VIEW_FRONT_0, VIEW_TOP
 from core.pipeline import PlantAnalysisResult, TraitResult, ViewLoadResult
 from core.pipeline import TRAIT_SPECS
 from config.settings import DEFAULT_CONFIG
 import gui.main_window as main_window_module
-from gui.main_window import ImageViewerDialog, PreprocessResult, StrawberryMainWindow
+from gui.main_window import ImageViewerDialog, PreprocessResult, PreprocessThread, StrawberryMainWindow
+from gui.color_card_selector import ColorCardRegion, ColorCardRegions
 
 
 def _write_png(path: Path, image: np.ndarray) -> None:
@@ -46,8 +48,8 @@ def test_main_window_initializes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert window.results_table.columnCount() == 2
     assert window.card_width_spin.value() == 1.50
     assert window.card_height_spin.value() == 1.50
-    assert window.preview_view_prev_button.text() == "‹"
-    assert window.preview_view_next_button.text() == "›"
+    assert window.preview_view_prev_button.text() == "<"
+    assert window.preview_view_next_button.text() == ">"
     assert window.preview_view_name_label.text() == "TOP"
     assert window.preview_view_index_label.text() == "1 / 1"
     assert window.preview_notice_label.text() == ""
@@ -55,6 +57,7 @@ def test_main_window_initializes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert window.calib_preview.title.text() == "2. 颜色校正"
     assert window.mask_preview.title.text() == "3. 背景消除"
     assert window.final_preview.title.text() == "4. 表型提取"
+    assert all(group.title() != "当前样本信息" for group in window.findChildren(QGroupBox))
     assert not window.trait_gallery_group.isVisible()
     for card in (
         window.orig_preview,
@@ -139,6 +142,99 @@ def test_grouping_issue_message_lists_problem_files(monkeypatch: pytest.MonkeyPa
     assert "4A、4B 都是错误命名" in message
     assert "重新扫描" in message
     window.close()
+
+
+def test_select_color_card_regions_skips_missing_optional_front_view(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Two-view cotton samples should pass None for the absent FRONT-2 image."""
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(StrawberryMainWindow, "_load_groups", lambda self, directory: None)
+
+    window = StrawberryMainWindow()
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=tmp_path / "top.jpg",
+        front_0_image=tmp_path / "front.jpg",
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+    window.groups = [group]
+    monkeypatch.setattr(window, "_selected_group", lambda: group)
+    monkeypatch.setattr(window, "_update_color_card_status", lambda: None)
+    monkeypatch.setattr(window, "_update_color_card_preview", lambda: None)
+    monkeypatch.setattr(main_window_module, "save_color_card_regions", lambda regions, path: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    image = np.zeros((12, 12, 3), dtype=np.uint8)
+
+    def fake_imread(path: str) -> np.ndarray | None:
+        return None if path == "None" else image
+
+    captured: dict[str, np.ndarray | None] = {}
+
+    def fake_selector(**kwargs) -> ColorCardRegions:
+        captured.update(
+            {
+                "top_image": kwargs["top_image"],
+                "front_1_image": kwargs["front_1_image"],
+                "front_2_image": kwargs["front_2_image"],
+            }
+        )
+        region = ColorCardRegion(1, 1, 4, 4)
+        return ColorCardRegions(top=region, front_1=region, front_2=None)
+
+    monkeypatch.setattr(cv2, "imread", fake_imread)
+    monkeypatch.setattr(main_window_module, "select_color_card_regions_interactive", fake_selector)
+
+    window._handle_select_color_card_regions()
+
+    assert captured["top_image"] is image
+    assert captured["front_1_image"] is image
+    assert captured["front_2_image"] is None
+    window.close()
+
+
+def test_preprocess_runtime_visualizations_are_downsampled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Runtime preprocessing previews should not write full-resolution PNGs."""
+
+    captured_steps: list[tuple[str, np.ndarray]] = []
+
+    def fake_save_debug_steps(
+        sample_id: str,
+        category_key: str,
+        steps: list[tuple[str, np.ndarray]],
+        *,
+        output_root: str | Path,
+    ) -> list[Path]:
+        captured_steps.extend(steps)
+        return [Path(output_root) / sample_id / category_key / "preview.png"]
+
+    monkeypatch.setattr("utils.debug_artifacts.save_debug_steps", fake_save_debug_steps)
+
+    large = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    result = PreprocessResult(sample_id="1AB")
+    result.loaded_images["TOP"] = large
+    result.calibrated_images["TOP"] = large.copy()
+
+    region = ColorCardRegion(1, 1, 4, 4)
+    worker = PreprocessThread(
+        group=PlantImageGroup(sample_id="1AB"),
+        color_card_regions=ColorCardRegions(top=region, front_1=region, front_2=region),
+        calibration_reference=None,
+        debug_output_dir=tmp_path,
+        save_full_debug=False,
+    )
+
+    worker._save_preprocess_visualizations(result)
+
+    assert captured_steps
+    assert all(max(image.shape[:2]) <= 1200 for _, image in captured_steps)
 
 
 def test_trait_table_selection_updates_center_trait_focus(monkeypatch: pytest.MonkeyPatch) -> None:

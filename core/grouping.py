@@ -20,8 +20,13 @@ VIEW_TOP = "TOP"
 VIEW_FRONT_0 = "1"
 VIEW_FRONT_180 = "2"
 SUPPORTED_VIEWS = (VIEW_TOP, VIEW_FRONT_0, VIEW_FRONT_180)
+TWO_VIEW_REQUIRED_VIEWS = (VIEW_TOP, VIEW_FRONT_0)
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 STANDARD_SAMPLE_ID_PATTERN = re.compile(r"^\d+AB$", re.IGNORECASE)
+COTTON_VIEW_FOLDER_MAP = {
+    "\u4fef\u89c6\u56fe": VIEW_TOP,
+    "\u5e73\u89c6\u56fe": VIEW_FRONT_0,
+}
 
 
 @dataclass(slots=True)
@@ -35,29 +40,27 @@ class GroupingSuggestion:
 
 @dataclass(slots=True)
 class PlantImageGroup:
-    """A three-view image group for a single strawberry plant."""
+    """A multi-view image group for a single plant."""
 
     sample_id: str
     top_image: Path | None = None
     front_0_image: Path | None = None
     front_180_image: Path | None = None
+    required_views: tuple[str, ...] = SUPPORTED_VIEWS
     extra_files: list[Path] = field(default_factory=list)
 
     @property
     def is_complete(self) -> bool:
         """Return whether the group contains all required views."""
-        return self.top_image is not None and self.front_0_image is not None and self.front_180_image is not None
+        return all(self._path_for_view(view) is not None for view in self.required_views)
 
     @property
     def missing_views(self) -> list[str]:
         """Return the missing view labels for the current group."""
         missing: list[str] = []
-        if self.top_image is None:
-            missing.append(VIEW_TOP)
-        if self.front_0_image is None:
-            missing.append(VIEW_FRONT_0)
-        if self.front_180_image is None:
-            missing.append(VIEW_FRONT_180)
+        for view in self.required_views:
+            if self._path_for_view(view) is None:
+                missing.append(view)
         return missing
 
     def to_dict(self) -> dict[str, str | list[str] | bool | None]:
@@ -69,8 +72,20 @@ class PlantImageGroup:
             "front_180": str(self.front_180_image) if self.front_180_image else None,
             "is_complete": self.is_complete,
             "missing_views": self.missing_views,
+            "required_views": list(self.required_views),
             "extra_files": [str(path) for path in self.extra_files],
         }
+
+    def _path_for_view(self, view: str) -> Path | None:
+        """Return the image path for a normalized grouping view label."""
+
+        if view == VIEW_TOP:
+            return self.top_image
+        if view == VIEW_FRONT_0:
+            return self.front_0_image
+        if view == VIEW_FRONT_180:
+            return self.front_180_image
+        raise ValueError(f"Unsupported view label: {view}")
 
 
 def group_image_files(
@@ -98,7 +113,7 @@ def group_image_files(
     if not directory.is_dir():
         raise NotADirectoryError(f"Path is not a directory: {directory}")
 
-    groups: dict[str, PlantImageGroup] = {}
+    groups = _group_two_view_folder_images(directory)
     normalized_overrides = _normalize_override_keys(overrides)
 
     for image_path in sorted(path for path in directory.iterdir() if _is_supported_image(path)):
@@ -115,6 +130,30 @@ def group_image_files(
         _assign_view(group, image_path, view)
 
     return sorted(groups.values(), key=lambda group: group.sample_id)
+
+
+def _group_two_view_folder_images(directory: Path) -> dict[str, PlantImageGroup]:
+    """Group images stored under cotton-style top/front view folders."""
+
+    groups: dict[str, PlantImageGroup] = {}
+    view_folders = {
+        COTTON_VIEW_FOLDER_MAP[path.name.strip()]: path
+        for path in directory.iterdir()
+        if path.is_dir() and path.name.strip() in COTTON_VIEW_FOLDER_MAP
+    }
+    if not view_folders:
+        return groups
+
+    for view, folder_path in view_folders.items():
+        for image_path in sorted(path for path in folder_path.iterdir() if _is_supported_image(path)):
+            sample_id = _normalize_sample_id(image_path.stem)
+            group = groups.setdefault(
+                sample_id,
+                PlantImageGroup(sample_id=sample_id, required_views=TWO_VIEW_REQUIRED_VIEWS),
+            )
+            _assign_view(group, image_path, view)
+
+    return groups
 
 
 def collect_grouping_suggestions(directory_path: str | Path) -> list[GroupingSuggestion]:

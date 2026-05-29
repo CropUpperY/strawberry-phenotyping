@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.batch_processor import BatchAnalysisReport, BatchSampleResult
-from core.grouping import PlantImageGroup
+from core.grouping import PlantImageGroup, VIEW_FRONT_0, VIEW_TOP
 from core.pipeline import PlantAnalysisResult, TraitResult
 from utils.exporter import (
     _to_chinese_header,
@@ -91,6 +91,27 @@ def test_build_view_records_outputs_one_row_per_view() -> None:
     assert "source_sink_ratio" not in records[1]
     assert records[2]["canopy_height"] == 6.0
     assert records[2]["side_projection_area"] == 4.0
+
+
+def test_build_view_records_omits_missing_optional_front_view() -> None:
+    """Two-view cotton groups should export only TOP and FRONT-1 rows."""
+
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=Path("data/cotton/top/cotton-1.jpg"),
+        front_0_image=Path("data/cotton/front/cotton-1.jpg"),
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+    result = _build_result()
+    result.view_results.pop("FRONT-2")
+    result.calibration_results.pop("FRONT-2")
+    result.front_segmentations.pop("FRONT-2")
+
+    records = build_view_records(group, result)
+
+    assert [record["view_name"] for record in records] == ["TOP", "FRONT-1"]
+    assert records[1]["canopy_height"] == 4.0
+    assert records[1]["side_projection_area"] == 2.0
 
 
 def test_export_single_result_writes_csv(tmp_path: Path) -> None:

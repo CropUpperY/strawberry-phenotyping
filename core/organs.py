@@ -47,6 +47,14 @@ class TopFruitDetectionResult:
     debug_images: dict[str, np.ndarray] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _MaskRoi:
+    image: np.ndarray
+    mask: np.ndarray
+    origin_xy: tuple[int, int]
+    full_shape: tuple[int, int]
+
+
 DetectionResultT = TypeVar("DetectionResultT", TopFlowerDetectionResult, TopFruitDetectionResult)
 
 
@@ -63,27 +71,30 @@ def detect_top_flowers(image: np.ndarray, canopy_mask: np.ndarray) -> TopFlowerD
     """Detect visible flowers using yellow-center anchors plus white-petal support."""
 
     validated_image, validated_mask = _validate_inputs(image, canopy_mask)
-    canopy_source = cv2.bitwise_and(validated_image, validated_image, mask=validated_mask)
-    yellow_center_mask = _extract_flower_center_mask(validated_image, validated_mask)
-    white_petal_raw, white_petal_cleaned = _extract_flower_petal_masks(validated_image, validated_mask)
+    roi = _crop_to_mask_roi(validated_image, validated_mask)
+    work_image = roi.image
+    work_mask = roi.mask
+    canopy_source = cv2.bitwise_and(work_image, work_image, mask=work_mask)
+    yellow_center_mask = _extract_flower_center_mask(work_image, work_mask)
+    white_petal_raw, white_petal_cleaned = _extract_flower_petal_masks(work_image, work_mask)
     flower_seeds = _collect_flower_seeds(yellow_center_mask)
     labeled_mask, kept_mask, instances, support_mask, marker_mask = _assemble_flower_instances(
         white_petal_cleaned,
         flower_seeds,
     )
-    overlay = _build_overlay(validated_image, labeled_mask)
+    overlay = _build_overlay(work_image, labeled_mask)
     debug_images = {
         "canopy_source": canopy_source,
         "yellow_center_mask": yellow_center_mask,
         "white_petal_mask_raw": white_petal_raw,
         "white_petal_mask_cleaned": white_petal_cleaned,
-        "flower_seed_overlay": _draw_flower_seed_overlay(validated_image, flower_seeds),
+        "flower_seed_overlay": _draw_flower_seed_overlay(work_image, flower_seeds),
         "flower_merge_result": support_mask,
         "flower_split_markers": marker_mask,
         "labeled_mask": np.clip(labeled_mask * 40, 0, 255).astype(np.uint8),
         "overlay": overlay,
     }
-    return TopFlowerDetectionResult(
+    cropped_result = TopFlowerDetectionResult(
         status="computed",
         message="flower count computed from TOP view visible blooms anchored by yellow centers.",
         count=len(instances),
@@ -93,13 +104,17 @@ def detect_top_flowers(image: np.ndarray, canopy_mask: np.ndarray) -> TopFlowerD
         overlay_image=overlay,
         debug_images=debug_images,
     )
+    return _restore_detection_to_full_image(cropped_result, roi=roi, full_image=validated_image)
 
 
 def detect_top_fruits(image: np.ndarray, canopy_mask: np.ndarray) -> TopFruitDetectionResult:
     """Detect visible red fruits inside the TOP canopy mask."""
 
     validated_image, validated_mask = _validate_inputs(image, canopy_mask)
-    hsv = cv2.cvtColor(validated_image, cv2.COLOR_BGR2HSV)
+    roi = _crop_to_mask_roi(validated_image, validated_mask)
+    work_image = roi.image
+    work_mask = roi.mask
+    hsv = cv2.cvtColor(work_image, cv2.COLOR_BGR2HSV)
     red_mask_1 = cv2.inRange(
         hsv,
         np.array([0, 80, 50], dtype=np.uint8),
@@ -111,9 +126,9 @@ def detect_top_fruits(image: np.ndarray, canopy_mask: np.ndarray) -> TopFruitDet
         np.array([179, 255, 255], dtype=np.uint8),
     )
     raw_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
-    return _finalize_detection(
-        image=validated_image,
-        canopy_mask=validated_mask,
+    cropped_result = _finalize_detection(
+        image=work_image,
+        canopy_mask=work_mask,
         raw_mask=raw_mask,
         min_area=45,
         label="fruit",
@@ -124,6 +139,7 @@ def detect_top_fruits(image: np.ndarray, canopy_mask: np.ndarray) -> TopFruitDet
         min_circularity=0.45,
         result_type=TopFruitDetectionResult,
     )
+    return _restore_detection_to_full_image(cropped_result, roi=roi, full_image=validated_image)
 
 
 def _extract_flower_center_mask(image: np.ndarray, canopy_mask: np.ndarray) -> np.ndarray:
@@ -326,7 +342,13 @@ def _filter_small_components(mask: np.ndarray, *, min_area: int) -> np.ndarray:
         area = int(stats[label_id, cv2.CC_STAT_AREA])
         if area < min_area:
             continue
-        filtered[labels == label_id] = 255
+        x = int(stats[label_id, cv2.CC_STAT_LEFT])
+        y = int(stats[label_id, cv2.CC_STAT_TOP])
+        width = int(stats[label_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        label_roi = labels[y:y + height, x:x + width]
+        filtered_roi = filtered[y:y + height, x:x + width]
+        filtered_roi[label_roi == label_id] = 255
     return filtered
 
 
@@ -346,6 +368,78 @@ def _validate_inputs(image: np.ndarray, canopy_mask: np.ndarray) -> tuple[np.nda
 
     normalized_mask = (canopy_mask > 0).astype(np.uint8) * 255
     return image, normalized_mask
+
+
+def _crop_to_mask_roi(image: np.ndarray, canopy_mask: np.ndarray, *, min_padding: int = 24) -> _MaskRoi:
+    """Crop image and mask to the padded canopy bounds for organ detection."""
+
+    ys, xs = np.where(canopy_mask > 0)
+    if xs.size == 0:
+        return _MaskRoi(
+            image=image,
+            mask=canopy_mask,
+            origin_xy=(0, 0),
+            full_shape=canopy_mask.shape,
+        )
+
+    image_height, image_width = canopy_mask.shape
+    padding = max(int(min_padding), int(round(min(image_height, image_width) * 0.02)))
+    x0 = max(0, int(xs.min()) - padding)
+    y0 = max(0, int(ys.min()) - padding)
+    x1 = min(image_width, int(xs.max()) + padding + 1)
+    y1 = min(image_height, int(ys.max()) + padding + 1)
+
+    return _MaskRoi(
+        image=image[y0:y1, x0:x1],
+        mask=canopy_mask[y0:y1, x0:x1],
+        origin_xy=(x0, y0),
+        full_shape=canopy_mask.shape,
+    )
+
+
+def _restore_detection_to_full_image(
+    result: DetectionResultT,
+    *,
+    roi: _MaskRoi,
+    full_image: np.ndarray,
+) -> DetectionResultT:
+    """Expand a cropped detection payload back to full-image coordinates."""
+
+    x0, y0 = roi.origin_xy
+    if (x0, y0) == (0, 0) and result.mask.shape == roi.full_shape:
+        return result
+
+    full_height, full_width = roi.full_shape
+    roi_height, roi_width = result.mask.shape[:2]
+    full_mask = np.zeros((full_height, full_width), dtype=result.mask.dtype)
+    full_labeled = np.zeros((full_height, full_width), dtype=result.labeled_mask.dtype)
+    full_mask[y0:y0 + roi_height, x0:x0 + roi_width] = result.mask
+    full_labeled[y0:y0 + roi_height, x0:x0 + roi_width] = result.labeled_mask
+
+    overlay = full_image.copy()
+    overlay[y0:y0 + roi_height, x0:x0 + roi_width] = result.overlay_image
+    instances = [_offset_instance(instance, offset_xy=roi.origin_xy) for instance in result.instances]
+    result.mask = full_mask
+    result.labeled_mask = full_labeled
+    result.instances = instances
+    result.overlay_image = overlay
+    return result
+
+
+def _offset_instance(instance: OrganInstance, *, offset_xy: tuple[int, int]) -> OrganInstance:
+    """Translate one cropped instance into full-image coordinates."""
+
+    x0, y0 = offset_xy
+    bounding_box = instance.bounding_box
+    if bounding_box is not None:
+        x, y, width, height = bounding_box
+        bounding_box = (x + x0, y + y0, width, height)
+    return OrganInstance(
+        label_id=instance.label_id,
+        area_pixels=instance.area_pixels,
+        centroid_xy=(instance.centroid_xy[0] + x0, instance.centroid_xy[1] + y0),
+        bounding_box=bounding_box,
+    )
 
 
 def _finalize_detection(
@@ -385,8 +479,15 @@ def _finalize_detection(
     filtered_labels = np.zeros_like(split_labels, dtype=np.int32)
     public_instances: list[OrganInstance] = []
     for next_id, instance in enumerate(instances, start=1):
-        filtered_labels[split_labels == instance.label_id] = next_id
-        kept_mask[split_labels == instance.label_id] = 255
+        if instance.bounding_box is None:
+            continue
+        x, y, width, height = instance.bounding_box
+        split_roi = split_labels[y:y + height, x:x + width]
+        filtered_roi = filtered_labels[y:y + height, x:x + width]
+        kept_roi = kept_mask[y:y + height, x:x + width]
+        instance_pixels = split_roi == instance.label_id
+        filtered_roi[instance_pixels] = next_id
+        kept_roi[instance_pixels] = 255
         public_instances.append(
             OrganInstance(
                 label_id=next_id,
@@ -476,12 +577,18 @@ def _collect_instances(
     """Collect surviving instances from a label image."""
 
     instances: list[OrganInstance] = []
-    for label_id in sorted(int(value) for value in np.unique(labeled_mask) if value > 0):
-        binary = (labeled_mask == label_id).astype(np.uint8)
-        area = int(binary.sum())
+    foreground_y, foreground_x = np.nonzero(labeled_mask > 0)
+    if foreground_x.size == 0:
+        return instances
+
+    foreground_labels = labeled_mask[foreground_y, foreground_x].astype(np.int32)
+    for label_id in sorted(int(value) for value in np.unique(foreground_labels)):
+        label_indices = foreground_labels == label_id
+        ys = foreground_y[label_indices]
+        xs = foreground_x[label_indices]
+        area = int(xs.size)
         if area < min_area:
             continue
-        ys, xs = np.where(binary > 0)
         contour_points = np.column_stack([xs, ys]).astype(np.int32)
         x, y, width, height = cv2.boundingRect(contour_points)
         short_side = min(width, height)
@@ -496,7 +603,8 @@ def _collect_instances(
         if max_aspect_ratio is not None and aspect_ratio > max_aspect_ratio:
             continue
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        local_binary = (labeled_mask[y:y + height, x:x + width] == label_id).astype(np.uint8)
+        contours, _ = cv2.findContours(local_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         perimeter = cv2.arcLength(contours[0], True) if contours else 0.0
         circularity = (4.0 * float(np.pi) * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
         if circularity < min_circularity:
@@ -516,10 +624,15 @@ def _build_overlay(image: np.ndarray, labeled_mask: np.ndarray) -> np.ndarray:
     """Draw simple bounding boxes and labels for each detected instance."""
 
     overlay = image.copy()
-    for label_id in sorted(int(value) for value in np.unique(labeled_mask) if value > 0):
-        ys, xs = np.where(labeled_mask == label_id)
-        if xs.size == 0:
-            continue
+    foreground_y, foreground_x = np.nonzero(labeled_mask > 0)
+    if foreground_x.size == 0:
+        return overlay
+
+    foreground_labels = labeled_mask[foreground_y, foreground_x].astype(np.int32)
+    for label_id in sorted(int(value) for value in np.unique(foreground_labels)):
+        label_indices = foreground_labels == label_id
+        ys = foreground_y[label_indices]
+        xs = foreground_x[label_indices]
         contour_points = np.column_stack([xs, ys]).astype(np.int32)
         x, y, width, height = cv2.boundingRect(contour_points)
         cv2.rectangle(overlay, (x, y), (x + width, y + height), (255, 255, 0), 2)
@@ -541,6 +654,12 @@ def _normalize_labels(labeled_mask: np.ndarray, *, keep_labels_gt: int) -> np.nd
     normalized = np.zeros_like(labeled_mask, dtype=np.int32)
     next_id = 1
     for label_id in sorted(int(value) for value in np.unique(labeled_mask) if value > keep_labels_gt):
-        normalized[labeled_mask == label_id] = next_id
+        ys, xs = np.where(labeled_mask == label_id)
+        if xs.size == 0:
+            continue
+        x, y, width, height = cv2.boundingRect(np.column_stack([xs, ys]).astype(np.int32))
+        source_roi = labeled_mask[y:y + height, x:x + width]
+        target_roi = normalized[y:y + height, x:x + width]
+        target_roi[source_roi == label_id] = next_id
         next_id += 1
     return normalized

@@ -78,8 +78,18 @@ def build_view_records(
 
     return [
         _build_view_record(group, result, view_name, include_debug_fields=include_debug_fields)
-        for view_name in VIEW_SEQUENCE
+        for view_name in _export_views_for_result(group, result)
     ]
+
+
+def _export_views_for_result(group: PlantImageGroup, result: PlantAnalysisResult) -> tuple[str, ...]:
+    """Return export views that are present in this result or on the group."""
+
+    return tuple(
+        view_name
+        for view_name in VIEW_SEQUENCE
+        if view_name in result.view_results or _group_image_path(group, view_name)
+    )
 
 
 def _build_view_record(

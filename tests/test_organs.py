@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 
-from core.organs import _assemble_flower_instances
+from core.organs import _assemble_flower_instances, _crop_to_mask_roi
 from core.organs import _FlowerSeed
 from core.organs import detect_top_flowers, detect_top_fruits
 
@@ -47,6 +47,40 @@ def test_detect_top_fruits_counts_visible_red_regions() -> None:
     assert result.status == "computed"
     assert result.count == 2
     assert len(result.instances) == 2
+
+
+def test_detect_top_fruits_preserves_full_size_outputs_when_canopy_is_localized() -> None:
+    """ROI acceleration should still return masks and overlays in the original coordinate space."""
+
+    image = np.zeros((260, 320, 3), dtype=np.uint8)
+    image[:, :] = (30, 120, 30)
+    canopy_mask = np.zeros((260, 320), dtype=np.uint8)
+    cv2.rectangle(canopy_mask, (190, 130), (260, 205), 255, -1)
+    cv2.circle(image, (220, 160), 9, (30, 30, 220), -1)
+    cv2.circle(image, (242, 182), 10, (20, 40, 235), -1)
+
+    result = detect_top_fruits(image, canopy_mask)
+
+    assert result.count == 2
+    assert result.mask.shape == canopy_mask.shape
+    assert result.labeled_mask.shape == canopy_mask.shape
+    assert result.overlay_image.shape == image.shape
+    assert result.mask[160, 220] == 255
+    assert result.mask[182, 242] == 255
+
+
+def test_crop_to_mask_roi_limits_processing_to_padded_canopy_bounds() -> None:
+    """Localized canopy masks should produce a smaller processing ROI plus origin metadata."""
+
+    image = np.zeros((260, 320, 3), dtype=np.uint8)
+    canopy_mask = np.zeros((260, 320), dtype=np.uint8)
+    canopy_mask[130:206, 190:261] = 255
+
+    roi = _crop_to_mask_roi(image, canopy_mask, min_padding=10)
+
+    assert roi.origin_xy == (180, 120)
+    assert roi.image.shape == (96, 91, 3)
+    assert roi.mask.shape == (96, 91)
 
 
 def test_detect_top_organs_ignores_noise_and_outside_canopy() -> None:

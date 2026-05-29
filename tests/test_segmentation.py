@@ -85,6 +85,29 @@ def test_segment_top_view_plant_preserves_white_flowers_inside_canopy() -> None:
     assert cv2.countNonZero(result.debug_images["top_reproductive_mask"]) > 0
 
 
+def test_segment_top_view_plant_cotton_profile_removes_soil_and_far_noise() -> None:
+    """Cotton TOP segmentation should remove pot soil and distant greenish noise."""
+
+    image = np.zeros((360, 460, 3), dtype=np.uint8)
+    cv2.rectangle(image, (150, 160), (268, 255), (58, 78, 66), -1)
+    cv2.rectangle(image, (388, 110), (442, 286), (42, 82, 58), -1)
+    cv2.circle(image, (175, 132), 36, (30, 178, 44), -1)
+    cv2.circle(image, (242, 126), 34, (28, 170, 42), -1)
+    cv2.circle(image, (205, 184), 34, (34, 165, 48), -1)
+
+    result = segment_top_view_plant(image, profile="cotton")
+
+    assert result.status == "segmented"
+    assert result.mask[132, 175] == 255
+    assert result.mask[184, 205] == 255
+    assert result.mask[240, 210] == 0
+    assert result.mask[198, 420] == 0
+    assert cv2.countNonZero(result.debug_images["cotton_soil_removed_mask"]) > 0
+    assert cv2.countNonZero(result.debug_images["cotton_far_component_removed_mask"]) > 0
+    x, _y, width, _height = result.bounding_box
+    assert x + width < 320
+
+
 def test_segment_top_view_plant_handles_empty_foreground() -> None:
     """A dark background with no canopy should report no foreground."""
 
@@ -119,6 +142,10 @@ def test_segment_front_view_plant_returns_mask_and_bounding_box() -> None:
     assert "morphology_opened" in result.debug_images
     assert "morphology_closed" in result.debug_images
     assert "holes_filled_mask" in result.debug_images
+    assert "filtered_mask_before_front_augmentation" in result.debug_images
+    assert "front_weak_green_mask" in result.debug_images
+    assert "front_weak_green_seed_mask" in result.debug_images
+    assert "front_recovered_weak_green_mask" in result.debug_images
     assert "filtered_mask_before_front_rules" in result.debug_images
     assert "front_component_kept_mask" in result.debug_images
     assert "front_component_removed_mask" in result.debug_images
@@ -127,3 +154,53 @@ def test_segment_front_view_plant_returns_mask_and_bounding_box() -> None:
     assert width > 50
     assert height > 100
     assert x < 300
+
+
+def test_segment_front_view_plant_recovers_adjacent_shadow_leaf_regions() -> None:
+    """FRONT-view segmentation should recover nearby low-saturation leaf regions."""
+
+    image = np.zeros((280, 360, 3), dtype=np.uint8)
+    cv2.ellipse(image, (140, 150), (55, 80), 0, 0, 360, (30, 170, 40), -1)
+    cv2.ellipse(image, (220, 150), (45, 72), 0, 0, 360, (80, 90, 90), -1)
+
+    result = segment_front_view_plant(image)
+
+    assert result.status == "segmented"
+    assert result.mask[150, 220] == 255
+    assert result.mask_area_pixels > 20000
+    assert result.bounding_box is not None
+    assert cv2.countNonZero(result.debug_images["front_recovered_weak_green_mask"]) > 0
+    _, _, width, _ = result.bounding_box
+    assert width > 150
+
+
+def test_segment_front_view_plant_fills_reproductive_holes_near_canopy() -> None:
+    """FRONT display mask should keep flower/fruit pixels that sit inside the plant region."""
+
+    image = np.zeros((280, 360, 3), dtype=np.uint8)
+    cv2.ellipse(image, (165, 155), (72, 84), 0, 0, 360, (30, 170, 40), -1)
+    cv2.circle(image, (165, 155), 24, (235, 240, 210), -1)
+    cv2.circle(image, (165, 155), 8, (20, 210, 240), -1)
+    cv2.circle(image, (165, 155), 3, (12, 18, 16), -1)
+
+    result = segment_front_view_plant(image)
+
+    assert result.status == "segmented"
+    assert result.mask[155, 165] == 255
+    assert result.mask[148, 165] == 255
+    assert cv2.countNonZero(result.debug_images["front_reproductive_mask"]) > 0
+
+
+def test_segment_front_view_plant_removes_teal_pot_component() -> None:
+    """A bottom teal pot component should be removed even when its hue overlaps leaf green."""
+
+    image = np.zeros((320, 420, 3), dtype=np.uint8)
+    cv2.ellipse(image, (205, 120), (92, 72), 0, 0, 360, (28, 175, 42), -1)
+    cv2.rectangle(image, (60, 228), (360, 286), (92, 118, 86), -1)
+
+    result = segment_front_view_plant(image)
+
+    assert result.status == "segmented"
+    assert result.mask[120, 205] == 255
+    assert result.mask[258, 210] == 0
+    assert cv2.countNonZero(result.debug_images["front_pot_like_removed_mask"]) > 0

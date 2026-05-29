@@ -63,6 +63,7 @@ def segment_top_view_plant(
     image: np.ndarray,
     *,
     min_component_area_ratio: float = 0.0005,
+    profile: str = "default",
 ) -> TopSegmentationResult:
     """Segment the strawberry plant from a TOP-view RGB image."""
 
@@ -74,6 +75,9 @@ def segment_top_view_plant(
     filtered_mask, top_band_candidate, removed_top_band = _remove_top_attached_pot_band(filtered_mask)
     prepared["top_band_candidate_mask"] = top_band_candidate
     prepared["removed_top_pot_band"] = removed_top_band
+    if profile == "cotton":
+        filtered_mask, cotton_debug = _filter_cotton_top_view_mask(prepared["denoised"], filtered_mask)
+        prepared.update(cotton_debug)
     leaf_mask = filtered_mask
     plant_mask, reproductive_debug = _augment_top_mask_with_reproductive_organs(
         prepared["denoised"],
@@ -140,8 +144,24 @@ def segment_front_view_plant(
     """Segment the strawberry plant from one FRONT-view RGB image."""
 
     prepared = _prepare_segmentation(image, min_component_area_ratio=min_component_area_ratio)
-    prepared["filtered_mask_before_front_rules"] = prepared["filtered_mask"].copy()
-    filtered_mask, front_filter_debug = _filter_front_view_components(prepared["filtered_mask"])
+    prepared["filtered_mask_before_front_augmentation"] = prepared["filtered_mask"].copy()
+    augmented_mask, front_augment_debug = _augment_front_mask_with_weak_green_regions(
+        prepared["filtered_mask"],
+        hsv_green_mask=prepared["hsv_green_mask"],
+        green_dominance_mask=prepared["green_dominance_mask"],
+    )
+    prepared.update(front_augment_debug)
+    plant_mask, front_reproductive_debug = _augment_front_mask_with_reproductive_organs(
+        prepared["denoised"],
+        augmented_mask,
+    )
+    prepared.update(front_reproductive_debug)
+    prepared["filtered_mask_before_front_rules"] = plant_mask.copy()
+    filtered_mask, front_filter_debug = _filter_front_view_components(
+        plant_mask,
+        image=prepared["denoised"],
+        leaf_reference_mask=prepared["filtered_mask_before_front_augmentation"],
+    )
     prepared.update(front_filter_debug)
     prepared["filtered_mask"] = filtered_mask
     contours = _find_external_contours(filtered_mask)
@@ -285,22 +305,129 @@ def _filter_small_components(mask: np.ndarray, *, min_component_area_ratio: floa
     return filtered_mask
 
 
-def _filter_front_view_components(mask: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def _augment_front_mask_with_weak_green_regions(
+    strong_mask: np.ndarray,
+    *,
+    hsv_green_mask: np.ndarray,
+    green_dominance_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Recover shadowed FRONT leaf regions that satisfy HSV green cues near the main canopy."""
+
+    weak_green_mask = cv2.bitwise_and(hsv_green_mask, cv2.bitwise_not(green_dominance_mask))
+    weak_green_mask = cv2.bitwise_and(weak_green_mask, cv2.bitwise_not(strong_mask))
+    weak_green_mask = _filter_small_components(weak_green_mask, min_component_area_ratio=0.00008)
+
+    empty = np.zeros_like(strong_mask)
+    if cv2.countNonZero(strong_mask) == 0 or cv2.countNonZero(weak_green_mask) == 0:
+        return strong_mask, {
+            "front_weak_green_mask": weak_green_mask,
+            "front_weak_green_seed_mask": empty,
+            "front_recovered_weak_green_mask": empty,
+        }
+
+    image_height, image_width = strong_mask.shape
+    seed_size = _make_odd(max(5, int(round(min(image_height, image_width) * 0.018))))
+    seed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seed_size, seed_size))
+    strong_seed_mask = cv2.dilate(strong_mask, seed_kernel, iterations=1)
+
+    union_mask = cv2.bitwise_or(strong_seed_mask, weak_green_mask)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(union_mask, connectivity=8)
+    min_recovered_area = max(80, int(image_height * image_width * 0.00008))
+    min_recovered_height = max(10, int(image_height * 0.03))
+    recovered_mask = np.zeros_like(strong_mask)
+
+    for component_index in range(1, component_count):
+        height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+        if height < min_recovered_height:
+            continue
+
+        component_mask = (labels == component_index).astype(np.uint8) * 255
+        weak_component = cv2.bitwise_and(component_mask, weak_green_mask)
+        recovered_area = int(cv2.countNonZero(weak_component))
+        if recovered_area < min_recovered_area:
+            continue
+        if cv2.countNonZero(cv2.bitwise_and(component_mask, strong_seed_mask)) == 0:
+            continue
+
+        recovered_mask = cv2.bitwise_or(recovered_mask, weak_component)
+
+    augmented_mask = cv2.bitwise_or(strong_mask, recovered_mask)
+    return augmented_mask, {
+        "front_weak_green_mask": weak_green_mask,
+        "front_weak_green_seed_mask": strong_seed_mask,
+        "front_recovered_weak_green_mask": recovered_mask,
+    }
+
+
+def _augment_front_mask_with_reproductive_organs(
+    image: np.ndarray,
+    plant_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Recover non-green flower/fruit pixels enclosed by or adjacent to the FRONT canopy."""
+
+    allowed_region = _build_front_reproductive_allowed_region(plant_mask)
+    candidate_mask = _build_top_reproductive_candidate_mask(image)
+    reproductive_mask = cv2.bitwise_and(candidate_mask, allowed_region)
+    reproductive_mask = _filter_small_components(reproductive_mask, min_component_area_ratio=0.00002)
+
+    augmented_mask = cv2.bitwise_or(plant_mask, reproductive_mask)
+    augmented_mask = _fill_small_holes(augmented_mask)
+    return augmented_mask, {
+        "front_reproductive_allowed_region": allowed_region,
+        "front_reproductive_candidate_mask": candidate_mask,
+        "front_reproductive_mask": reproductive_mask,
+    }
+
+
+def _build_front_reproductive_allowed_region(plant_mask: np.ndarray) -> np.ndarray:
+    """Allow flower/fruit recovery inside each plant component without opening the whole frame."""
+
+    allowed_region = np.zeros_like(plant_mask)
+    contours = _find_external_contours(plant_mask)
+    min_area = max(64, int(plant_mask.shape[0] * plant_mask.shape[1] * 0.0002))
+    for contour in contours:
+        if cv2.contourArea(contour) < min_area:
+            continue
+        hull = cv2.convexHull(contour)
+        cv2.fillConvexPoly(allowed_region, hull, 255)
+
+    min_dim = min(plant_mask.shape)
+    dilate_size = _make_odd(max(7, int(round(min_dim * 0.025))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+    dilated_plant = cv2.dilate(plant_mask, kernel, iterations=1)
+    return cv2.bitwise_or(allowed_region, dilated_plant)
+
+
+def _filter_front_view_components(
+    mask: np.ndarray,
+    *,
+    image: np.ndarray | None = None,
+    leaf_reference_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Keep plausible canopy components and suppress side color-card patches."""
+
+    pot_filtered_mask, pot_debug = _remove_front_pot_like_pixels(
+        image,
+        mask,
+        leaf_reference_mask=leaf_reference_mask,
+    )
+    mask = pot_filtered_mask
 
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if component_count <= 1:
         empty = np.zeros_like(mask)
-        return mask, {
+        debug_images = {
             "front_component_kept_mask": mask.copy(),
             "front_component_removed_mask": empty,
         }
+        debug_images.update(pot_debug)
+        return mask, debug_images
 
     image_height, image_width = mask.shape
     image_area = image_height * image_width
     min_area_pixels = max(48, int(image_area * 0.00035))
-    filtered_mask = np.zeros_like(mask)
     removed_mask = np.zeros_like(mask)
+    candidates: list[tuple[int, int, np.ndarray]] = []
 
     for component_index in range(1, component_count):
         area = int(stats[component_index, cv2.CC_STAT_AREA])
@@ -322,12 +449,181 @@ def _filter_front_view_components(mask: np.ndarray) -> tuple[np.ndarray, dict[st
             removed_mask[component_mask] = 255
             continue
 
-        filtered_mask[component_mask] = 255
+        candidates.append((area, component_index, component_mask))
 
-    return filtered_mask, {
+    filtered_mask = np.zeros_like(mask)
+    if candidates:
+        _largest_area, largest_component_index, largest_component_mask = max(candidates, key=lambda item: item[0])
+        largest_x = int(stats[largest_component_index, cv2.CC_STAT_LEFT])
+        largest_y = int(stats[largest_component_index, cv2.CC_STAT_TOP])
+        largest_width = int(stats[largest_component_index, cv2.CC_STAT_WIDTH])
+        largest_height = int(stats[largest_component_index, cv2.CC_STAT_HEIGHT])
+        largest_box = (largest_x, largest_y, largest_width, largest_height)
+        filtered_mask[largest_component_mask] = 255
+
+        for _area, component_index, component_mask in candidates:
+            if component_index == largest_component_index:
+                continue
+
+            if _is_front_satellite_component(stats[component_index], largest_box, image_width, image_height):
+                filtered_mask[component_mask] = 255
+            else:
+                removed_mask[component_mask] = 255
+
+    debug_images = {
         "front_component_kept_mask": filtered_mask.copy(),
         "front_component_removed_mask": removed_mask,
     }
+    debug_images.update(pot_debug)
+    return filtered_mask, debug_images
+
+
+def _remove_front_pot_like_pixels(
+    image: np.ndarray | None,
+    mask: np.ndarray,
+    *,
+    leaf_reference_mask: np.ndarray | None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Remove bottom teal/gray-green pixels whose color is far from the leaf reference."""
+
+    empty = np.zeros_like(mask)
+    if image is None or leaf_reference_mask is None or cv2.countNonZero(mask) == 0:
+        return mask, {"front_pot_like_removed_mask": empty}
+
+    reference_pixels = _sample_front_leaf_reference_pixels(image, leaf_reference_mask)
+    if reference_pixels.size == 0:
+        return mask, {"front_pot_like_removed_mask": empty}
+
+    reference_hsv = cv2.cvtColor(reference_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    reference_lab = cv2.cvtColor(reference_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3)
+    ref_hsv_median = np.median(reference_hsv, axis=0).astype(np.float32)
+    ref_lab_median = np.median(reference_lab, axis=0).astype(np.float32)
+
+    reference_bgr = reference_pixels.astype(np.float32)
+    reference_green_excess = reference_bgr[:, 1] - np.maximum(reference_bgr[:, 0], reference_bgr[:, 2])
+    ref_green_excess = float(np.median(reference_green_excess))
+
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    bgr = image.astype(np.float32)
+    green_excess = bgr[:, :, 1] - np.maximum(bgr[:, :, 0], bgr[:, :, 2])
+    lab_delta = np.linalg.norm(lab_image - ref_lab_median.reshape(1, 1, 3), axis=2)
+
+    y_indices = np.indices(mask.shape)[0]
+    foreground_rows = np.flatnonzero(np.any(mask > 0, axis=1))
+    if foreground_rows.size == 0:
+        return mask, {"front_pot_like_removed_mask": empty}
+
+    y_min = int(foreground_rows[0])
+    y_max = int(foreground_rows[-1])
+    lower_canopy = y_indices >= y_min + int(round((y_max - y_min + 1) * 0.48))
+    greenish_hue = (hsv_image[:, :, 0] >= 32) & (hsv_image[:, :, 0] <= 105)
+    low_leaf_saturation = hsv_image[:, :, 1] < max(95.0, float(ref_hsv_median[1]) * 0.72)
+    weak_green_excess = green_excess < max(10.0, ref_green_excess * 0.55)
+    color_far_from_leaf = lab_delta > 24.0
+
+    pot_like = (
+        (mask > 0)
+        & lower_canopy
+        & greenish_hue
+        & color_far_from_leaf
+        & (low_leaf_saturation | weak_green_excess)
+    ).astype(np.uint8) * 255
+
+    open_size = _make_odd(max(3, int(round(min(mask.shape) * 0.004))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size))
+    pot_like = cv2.morphologyEx(pot_like, cv2.MORPH_OPEN, kernel)
+    pot_like = _keep_large_bottom_pot_components(pot_like, mask)
+    filtered_mask = cv2.subtract(mask, pot_like)
+    return filtered_mask, {"front_pot_like_removed_mask": pot_like}
+
+
+def _keep_large_bottom_pot_components(pot_like_mask: np.ndarray, foreground_mask: np.ndarray) -> np.ndarray:
+    """Keep only pot-color regions with the broad bottom geometry expected from a pot."""
+
+    foreground_rows = np.flatnonzero(np.any(foreground_mask > 0, axis=1))
+    if foreground_rows.size == 0:
+        return np.zeros_like(pot_like_mask)
+
+    image_height, image_width = pot_like_mask.shape
+    foreground_top = int(foreground_rows[0])
+    foreground_bottom = int(foreground_rows[-1])
+    lower_start = foreground_top + int(round((foreground_bottom - foreground_top + 1) * 0.50))
+    min_area = max(128, int(image_height * image_width * 0.001))
+    min_width = max(24, int(image_width * 0.12))
+    min_height = max(8, int(image_height * 0.025))
+
+    kept_mask = np.zeros_like(pot_like_mask)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(pot_like_mask, connectivity=8)
+    for component_index in range(1, component_count):
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        x = int(stats[component_index, cv2.CC_STAT_LEFT])
+        y = int(stats[component_index, cv2.CC_STAT_TOP])
+        width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+        _ = x
+        if area < min_area or width < min_width or height < min_height:
+            continue
+        if y < lower_start:
+            continue
+
+        kept_mask[labels == component_index] = 255
+
+    return kept_mask
+
+
+def _sample_front_leaf_reference_pixels(image: np.ndarray, reference_mask: np.ndarray) -> np.ndarray:
+    """Sample likely leaf pixels from the upper part of the largest green component."""
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(reference_mask, connectivity=8)
+    if component_count <= 1:
+        return np.empty((0, 3), dtype=image.dtype)
+
+    largest_index = max(
+        range(1, component_count),
+        key=lambda index: int(stats[index, cv2.CC_STAT_AREA]),
+    )
+    x = int(stats[largest_index, cv2.CC_STAT_LEFT])
+    y = int(stats[largest_index, cv2.CC_STAT_TOP])
+    width = int(stats[largest_index, cv2.CC_STAT_WIDTH])
+    height = int(stats[largest_index, cv2.CC_STAT_HEIGHT])
+    upper_cutoff = y + max(1, int(round(height * 0.72)))
+
+    component_mask = labels == largest_index
+    y_indices = np.indices(reference_mask.shape)[0]
+    sample_mask = component_mask & (y_indices < upper_cutoff)
+    pixels = image[sample_mask]
+    if pixels.size == 0:
+        pixels = image[component_mask]
+
+    _ = x, width
+    return pixels
+
+
+def _is_front_satellite_component(
+    stats_row: np.ndarray,
+    largest_box: tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+) -> bool:
+    """Keep flower/fruit satellites near the main canopy while dropping distant pot/card regions."""
+
+    x = int(stats_row[cv2.CC_STAT_LEFT])
+    y = int(stats_row[cv2.CC_STAT_TOP])
+    width = int(stats_row[cv2.CC_STAT_WIDTH])
+    height = int(stats_row[cv2.CC_STAT_HEIGHT])
+    area = int(stats_row[cv2.CC_STAT_AREA])
+
+    largest_x, largest_y, largest_width, largest_height = largest_box
+    largest_right = largest_x + largest_width
+    largest_bottom = largest_y + largest_height
+    component_center_y = y + height / 2.0
+    horizontal_overlap = min(x + width, largest_right) - max(x, largest_x)
+    near_horizontally = horizontal_overlap > -image_width * 0.08
+    near_vertically = y < largest_bottom + image_height * 0.08 and y + height > largest_y - image_height * 0.22
+    small_satellite = area < max(1, largest_width * largest_height * 0.08)
+
+    return small_satellite and near_horizontally and near_vertically and component_center_y < image_height * 0.72
 
 
 def _filter_top_view_components(mask: np.ndarray) -> np.ndarray:
@@ -366,6 +662,149 @@ def _filter_top_view_components(mask: np.ndarray) -> np.ndarray:
             filtered_mask[labels == component_index] = 0
 
     return filtered_mask
+
+
+def _filter_cotton_top_view_mask(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Remove pot soil and distant greenish noise from cotton TOP-view masks."""
+
+    empty = np.zeros_like(mask)
+    if cv2.countNonZero(mask) == 0:
+        return mask, {
+            "cotton_strong_leaf_seed_mask": empty,
+            "cotton_soil_removed_mask": empty,
+            "cotton_far_component_removed_mask": empty,
+        }
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    bgr = image.astype(np.float32)
+    green_excess = bgr[:, :, 1] - np.maximum(bgr[:, :, 0], bgr[:, :, 2])
+    strong_leaf = (
+        (mask > 0)
+        & (hsv[:, :, 0] >= 28)
+        & (hsv[:, :, 0] <= 92)
+        & (hsv[:, :, 1] >= 45)
+        & (hsv[:, :, 2] >= 45)
+        & (green_excess >= 32.0)
+    ).astype(np.uint8) * 255
+
+    if cv2.countNonZero(strong_leaf) == 0:
+        return mask, {
+            "cotton_strong_leaf_seed_mask": strong_leaf,
+            "cotton_soil_removed_mask": empty,
+            "cotton_far_component_removed_mask": empty,
+        }
+
+    soil_like = (
+        (mask > 0)
+        & ((green_excess < 28.0) | ((hsv[:, :, 1] < 55) & (green_excess < 36.0)))
+    ).astype(np.uint8) * 255
+    soil_like = _filter_small_components(soil_like, min_component_area_ratio=0.00012)
+    filtered_mask = cv2.subtract(mask, soil_like)
+
+    image_height, image_width = mask.shape
+    seed_size = _make_odd(max(9, int(round(min(image_height, image_width) * 0.045))))
+    seed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seed_size, seed_size))
+    strong_seed_region = cv2.dilate(strong_leaf, seed_kernel, iterations=1)
+
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(filtered_mask, connectivity=8)
+    kept_mask = np.zeros_like(mask)
+    far_removed_mask = np.zeros_like(mask)
+    min_area_pixels = max(48, int(image_height * image_width * 0.00025))
+    main_component_index = _select_cotton_top_main_component(
+        labels,
+        stats,
+        centroids,
+        strong_leaf,
+        image_width,
+        image_height,
+    )
+    main_box = (
+        int(stats[main_component_index, cv2.CC_STAT_LEFT]),
+        int(stats[main_component_index, cv2.CC_STAT_TOP]),
+        int(stats[main_component_index, cv2.CC_STAT_WIDTH]),
+        int(stats[main_component_index, cv2.CC_STAT_HEIGHT]),
+    ) if main_component_index is not None else None
+
+    for component_index in range(1, component_count):
+        component_mask = labels == component_index
+        component_area = int(stats[component_index, cv2.CC_STAT_AREA])
+        overlaps_leaf_seed = cv2.countNonZero(cv2.bitwise_and((component_mask.astype(np.uint8) * 255), strong_seed_region)) > 0
+        near_main = main_box is not None and _is_cotton_top_near_main_component(
+            stats[component_index],
+            main_box,
+            image_width,
+            image_height,
+        )
+        if component_index == main_component_index or (near_main and overlaps_leaf_seed) or component_area < min_area_pixels:
+            kept_mask[component_mask] = 255
+        else:
+            far_removed_mask[component_mask] = 255
+
+    return kept_mask, {
+        "cotton_strong_leaf_seed_mask": strong_leaf,
+        "cotton_soil_removed_mask": cv2.bitwise_and(mask, soil_like),
+        "cotton_far_component_removed_mask": far_removed_mask,
+    }
+
+
+def _select_cotton_top_main_component(
+    labels: np.ndarray,
+    stats: np.ndarray,
+    centroids: np.ndarray,
+    strong_leaf: np.ndarray,
+    image_width: int,
+    image_height: int,
+) -> int | None:
+    """Pick the cotton TOP component most likely to be the plant body."""
+
+    component_count = stats.shape[0]
+    image_center_x = image_width / 2.0
+    image_center_y = image_height / 2.0
+    best_index: int | None = None
+    best_score = float("-inf")
+
+    for component_index in range(1, component_count):
+        component_mask = (labels == component_index).astype(np.uint8) * 255
+        leaf_overlap = cv2.countNonZero(cv2.bitwise_and(component_mask, strong_leaf))
+        if leaf_overlap == 0:
+            continue
+
+        area = float(stats[component_index, cv2.CC_STAT_AREA])
+        width = float(stats[component_index, cv2.CC_STAT_WIDTH])
+        height = float(stats[component_index, cv2.CC_STAT_HEIGHT])
+        center_x = float(centroids[component_index, 0])
+        center_y = float(centroids[component_index, 1])
+        distance_penalty = (
+            abs(center_x - image_center_x) / max(image_width, 1)
+            + abs(center_y - image_center_y) / max(image_height, 1)
+        )
+        aspect_penalty = abs(np.log(max(height / max(width, 1.0), 0.01)))
+        score = leaf_overlap + area * 0.12 - area * distance_penalty - area * aspect_penalty * 0.08
+        if score > best_score:
+            best_score = score
+            best_index = component_index
+
+    return best_index
+
+
+def _is_cotton_top_near_main_component(
+    stats_row: np.ndarray,
+    main_box: tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+) -> bool:
+    """Return whether a TOP component is close enough to belong to the cotton plant."""
+
+    x = int(stats_row[cv2.CC_STAT_LEFT])
+    y = int(stats_row[cv2.CC_STAT_TOP])
+    width = int(stats_row[cv2.CC_STAT_WIDTH])
+    height = int(stats_row[cv2.CC_STAT_HEIGHT])
+    main_x, main_y, main_width, main_height = main_box
+    main_right = main_x + main_width
+    main_bottom = main_y + main_height
+    horizontal_gap = max(main_x - (x + width), x - main_right, 0)
+    vertical_gap = max(main_y - (y + height), y - main_bottom, 0)
+    return horizontal_gap <= image_width * 0.10 and vertical_gap <= image_height * 0.10
 
 
 def _augment_top_mask_with_reproductive_organs(

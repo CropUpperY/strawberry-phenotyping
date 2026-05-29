@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from inspect import Parameter, signature
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 
 import numpy as np
 
-from core.grouping import PlantImageGroup
+from core.grouping import (
+    PlantImageGroup,
+    VIEW_FRONT_0 as GROUP_VIEW_FRONT_0,
+    VIEW_FRONT_180 as GROUP_VIEW_FRONT_180,
+    VIEW_TOP as GROUP_VIEW_TOP,
+)
 from core.organs import detect_top_flowers, detect_top_fruits
 from core.traits import compute_front_view_traits, compute_top_traits, fuse_front_traits
 from core.yolo_counter import detect_top_organs_with_yolo, resolve_default_model_path
@@ -25,6 +32,17 @@ from utils.debug_artifacts import (
 VIEW_TOP = "TOP"
 VIEW_FRONT_0 = "FRONT-1"
 VIEW_FRONT_180 = "FRONT-2"
+VIEW_SEQUENCE = (VIEW_TOP, VIEW_FRONT_0, VIEW_FRONT_180)
+GROUP_TO_ANALYSIS_VIEW = {
+    GROUP_VIEW_TOP: VIEW_TOP,
+    GROUP_VIEW_FRONT_0: VIEW_FRONT_0,
+    GROUP_VIEW_FRONT_180: VIEW_FRONT_180,
+}
+VIEW_PATH_ATTRIBUTES = {
+    VIEW_TOP: "top_image",
+    VIEW_FRONT_0: "front_0_image",
+    VIEW_FRONT_180: "front_180_image",
+}
 
 STATUS_LABELS = {
     "uninitialized": "未开始",
@@ -46,7 +64,7 @@ STATUS_LABELS = {
 
 LogCallback = Callable[[str], None]
 ImageLoader = Callable[[Path], Any]
-TopSegmenter = Callable[[Any], Any]
+TopSegmenter = Callable[..., Any]
 FrontSegmenter = Callable[[Any], Any]
 ImageCalibrator = Callable[..., Any]
 TopFlowerDetector = Callable[[np.ndarray, np.ndarray], Any]
@@ -170,16 +188,7 @@ def analyze_plant_group(
         status="pending",
         message="分析尚未开始。",
         traits=_build_placeholder_traits(),
-        view_results={
-            VIEW_TOP: ViewLoadResult(VIEW_TOP, group.top_image, "missing", message="View not loaded."),
-            VIEW_FRONT_0: ViewLoadResult(VIEW_FRONT_0, group.front_0_image, "missing", message="View not loaded."),
-            VIEW_FRONT_180: ViewLoadResult(
-                VIEW_FRONT_180,
-                group.front_180_image,
-                "missing",
-                message="View not loaded.",
-            ),
-        },
+        view_results=_build_initial_view_results(group),
     )
 
     if not group.is_complete:
@@ -231,13 +240,13 @@ def analyze_plant_group(
         result.calibration_results = precomputed_calibration.get("calibration_results", {})
         
         # 更新视角加载状态
-        for view_name in (VIEW_TOP, VIEW_FRONT_0, VIEW_FRONT_180):
+        for view_name in result.view_results:
             if view_name in calibrated_images:
                 img = calibrated_images[view_name]
                 shape = tuple(int(v) for v in img.shape) if hasattr(img, "shape") else None
                 result.view_results[view_name] = ViewLoadResult(
                     view_name=view_name,
-                    path=getattr(group, {VIEW_TOP: "top_image", VIEW_FRONT_0: "front_0_image", VIEW_FRONT_180: "front_180_image"}[view_name], None),
+                    path=_group_image_path(group, view_name),
                     status="calibrated",
                     shape=shape,
                     message=f"{view_name} 已使用预处理结果。"
@@ -264,39 +273,31 @@ def analyze_plant_group(
         view_name=VIEW_TOP,
         segmenter=top_segmenter,
         image=calibrated_images[VIEW_TOP],
+        segmenter_kwargs=_top_segmentation_kwargs_for_group(group),
     )
     if top_segmentation is None:
         return result
     result.top_segmentation = top_segmentation
 
-    _emit(emit_log, "开始执行 FRONT-1 正视图分割")
-    front_0_segmentation = _run_segmentation_step(
-        result=result,
-        emit_log=emit_log,
-        view_name=VIEW_FRONT_0,
-        segmenter=front_segmenter,
-        image=calibrated_images[VIEW_FRONT_0],
-    )
-    if front_0_segmentation is None:
-        return result
-    result.front_segmentations[VIEW_FRONT_0] = front_0_segmentation
-
-    _emit(emit_log, "开始执行 FRONT-2 正视图分割")
-    front_180_segmentation = _run_segmentation_step(
-        result=result,
-        emit_log=emit_log,
-        view_name=VIEW_FRONT_180,
-        segmenter=front_segmenter,
-        image=calibrated_images[VIEW_FRONT_180],
-    )
-    if front_180_segmentation is None:
-        return result
-    result.front_segmentations[VIEW_FRONT_180] = front_180_segmentation
+    for front_view_name in _front_views_for_result(result):
+        _emit(emit_log, f"开始执行 {front_view_name} 正视图分割")
+        front_segmentation = _run_segmentation_step(
+            result=result,
+            emit_log=emit_log,
+            view_name=front_view_name,
+            segmenter=front_segmenter,
+            image=calibrated_images[front_view_name],
+        )
+        if front_segmentation is None:
+            return result
+        result.front_segmentations[front_view_name] = front_segmentation
 
     if top_organ_detector is not None:
         try:
+            organ_start = perf_counter()
             organ_filter_mask = _build_top_organ_filter_mask(top_segmentation)
             result.top_organ_detection = top_organ_detector(calibrated_images[VIEW_TOP], organ_filter_mask)
+            _emit(emit_log, f"TOP YOLO 器官检测完成，用时 {perf_counter() - organ_start:.2f}s")
         except Exception as error:  # noqa: BLE001
             result.errors.append(f"TOP YOLO organ detection failed: {error}")
             _emit(emit_log, f"TOP YOLO organ detection failed: {error}")
@@ -304,14 +305,18 @@ def analyze_plant_group(
 
     if result.top_organ_detection is None:
         try:
+            flower_start = perf_counter()
             result.top_flower_detection = top_flower_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+            _emit(emit_log, f"TOP 花朵检测完成，用时 {perf_counter() - flower_start:.2f}s")
         except Exception as error:  # noqa: BLE001
             result.errors.append(f"TOP flower detection failed: {error}")
             _emit(emit_log, f"TOP flower detection failed: {error}")
             result.top_flower_detection = None
 
     try:
+        fruit_start = perf_counter()
         result.top_fruit_detection = top_fruit_detector(calibrated_images[VIEW_TOP], top_segmentation.mask)
+        _emit(emit_log, f"TOP 果实检测完成，用时 {perf_counter() - fruit_start:.2f}s")
     except Exception as error:  # noqa: BLE001
         result.errors.append(f"TOP fruit detection failed: {error}")
         _emit(emit_log, f"TOP fruit detection failed: {error}")
@@ -340,9 +345,9 @@ def analyze_plant_group(
             _export_front_trait_debug_artifacts(
                 sample_id=group.sample_id,
                 front_0_image=calibrated_images[VIEW_FRONT_0],
-                front_180_image=calibrated_images[VIEW_FRONT_180],
-                front_0_segmentation=front_0_segmentation,
-                front_180_segmentation=front_180_segmentation,
+                front_0_segmentation=result.front_segmentations[VIEW_FRONT_0],
+                front_180_image=calibrated_images.get(VIEW_FRONT_180),
+                front_180_segmentation=result.front_segmentations.get(VIEW_FRONT_180),
                 output_root=output_root,
             )
         )
@@ -375,7 +380,10 @@ def analyze_plant_group(
     )
 
     _emit(emit_log, "开始计算 FRONT 性状并进行双视角融合")
-    front_measurements = fuse_front_traits(front_0_segmentation, front_180_segmentation)
+    front_measurements = fuse_front_traits(
+        result.front_segmentations[VIEW_FRONT_0],
+        result.front_segmentations.get(VIEW_FRONT_180),
+    )
     _apply_front_trait_measurements(
         result,
         front_measurements,
@@ -422,6 +430,52 @@ def _build_placeholder_traits() -> list[TraitResult]:
         )
         for spec in TRAIT_SPECS
     ]
+
+
+def _analysis_views_for_group(group: PlantImageGroup) -> tuple[str, ...]:
+    """Return pipeline view names required by the grouped sample."""
+
+    views: list[str] = []
+    for group_view in group.required_views:
+        view_name = GROUP_TO_ANALYSIS_VIEW.get(group_view, group_view)
+        if view_name not in views:
+            views.append(view_name)
+    return tuple(view for view in VIEW_SEQUENCE if view in views)
+
+
+def _build_initial_view_results(group: PlantImageGroup) -> dict[str, ViewLoadResult]:
+    """Build initial missing-state view records for the views this group requires."""
+
+    return {
+        view_name: ViewLoadResult(
+            view_name,
+            _group_image_path(group, view_name),
+            "missing",
+            message="View not loaded.",
+        )
+        for view_name in _analysis_views_for_group(group)
+    }
+
+
+def _group_image_path(group: PlantImageGroup, view_name: str) -> Path | None:
+    """Return the input path for one pipeline view name."""
+
+    attribute_name = VIEW_PATH_ATTRIBUTES[view_name]
+    return getattr(group, attribute_name)
+
+
+def _front_views_for_result(result: PlantAnalysisResult) -> tuple[str, ...]:
+    """Return the FRONT views expected in this analysis result."""
+
+    return tuple(view for view in (VIEW_FRONT_0, VIEW_FRONT_180) if view in result.view_results)
+
+
+def _top_segmentation_kwargs_for_group(group: PlantImageGroup) -> dict[str, str]:
+    """Return TOP segmentation options for plant-specific profiles."""
+
+    if set(group.required_views) == {GROUP_VIEW_TOP, GROUP_VIEW_FRONT_0} and group.front_180_image is None:
+        return {"profile": "cotton"}
+    return {}
 
 
 def _resolve_image_loader(result: PlantAnalysisResult, emit_log: LogCallback | None) -> ImageLoader | None:
@@ -540,11 +594,8 @@ def _load_group_images(
     loaded_images: dict[str, Any] = {}
     has_failure = False
 
-    for view_name, image_path in (
-        (VIEW_TOP, group.top_image),
-        (VIEW_FRONT_0, group.front_0_image),
-        (VIEW_FRONT_180, group.front_180_image),
-    ):
+    for view_name in result.view_results:
+        image_path = _group_image_path(group, view_name)
         if image_path is None:
             has_failure = True
             result.view_results[view_name] = ViewLoadResult(
@@ -609,7 +660,7 @@ def _calibrate_group_images(
 
     calibrated_images: dict[str, Any] = {}
 
-    for view_name in (VIEW_TOP, VIEW_FRONT_0, VIEW_FRONT_180):
+    for view_name, image in loaded_images.items():
         _emit(emit_log, f"开始执行 {view_name} 色卡检测与校正")
         
         # 获取该视角的手动区域（如果有）
@@ -620,20 +671,20 @@ def _calibrate_group_images(
             if calibration_reference is None:
                 try:
                     calibration = image_calibrator(
-                        loaded_images[view_name], 
+                        image,
                         view_name=view_name,
                         manual_region=manual_region,
                     )
                 except TypeError:
                     # 兼容不支持manual_region的旧实现
                     calibration = image_calibrator(
-                        loaded_images[view_name], 
+                        image,
                         view_name=view_name,
                     )
             else:
                 try:
                     calibration = image_calibrator(
-                        loaded_images[view_name],
+                        image,
                         view_name=view_name,
                         reference=calibration_reference,
                         manual_region=manual_region,
@@ -642,24 +693,24 @@ def _calibrate_group_images(
                     # 兼容不同签名的calibrator
                     try:
                         calibration = image_calibrator(
-                            loaded_images[view_name],
+                            image,
                             view_name=view_name,
                             reference=calibration_reference,
                         )
                     except TypeError:
                         calibration = image_calibrator(
-                            loaded_images[view_name], 
+                            image,
                             view_name=view_name,
                         )
         except Exception as error:  # noqa: BLE001
             calibration = _fallback_calibration_result(
-                loaded_images[view_name],
+                image,
                 view_name=view_name,
                 message=f"{view_name} 色卡校正异常，已回退到原图: {error}",
             )
 
         result.calibration_results[view_name] = calibration
-        calibrated_images[view_name] = getattr(calibration, "corrected_image", loaded_images[view_name])
+        calibrated_images[view_name] = getattr(calibration, "corrected_image", image)
 
         if getattr(calibration, "is_calibrated", False):
             _emit(
@@ -705,13 +756,15 @@ def _run_segmentation_step(
     result: PlantAnalysisResult,
     emit_log: LogCallback | None,
     view_name: str,
-    segmenter: Callable[[Any], Any],
+    segmenter: Callable[..., Any],
     image: Any,
+    segmenter_kwargs: dict[str, Any] | None = None,
 ) -> Any | None:
     """Run one segmentation step and normalize failure handling."""
 
+    started_at = perf_counter()
     try:
-        segmentation = segmenter(image)
+        segmentation = _call_segmenter(segmenter, image, segmenter_kwargs or {})
     except Exception as error:  # noqa: BLE001
         result.status = "segmentation_failed"
         result.message = f"{view_name} 分割失败: {error}"
@@ -726,7 +779,29 @@ def _run_segmentation_step(
         _emit(emit_log, result.message)
         return None
 
+    _emit(emit_log, f"{view_name} 分割完成，用时 {perf_counter() - started_at:.2f}s")
     return segmentation
+
+
+def _call_segmenter(segmenter: Callable[..., Any], image: Any, segmenter_kwargs: dict[str, Any]) -> Any:
+    """Call a segmenter with optional kwargs only when its signature supports them."""
+
+    if not segmenter_kwargs or not _segmenter_accepts_kwargs(segmenter, segmenter_kwargs):
+        return segmenter(image)
+    return segmenter(image, **segmenter_kwargs)
+
+
+def _segmenter_accepts_kwargs(segmenter: Callable[..., Any], segmenter_kwargs: dict[str, Any]) -> bool:
+    """Return whether a segmenter can accept all requested keyword arguments."""
+
+    try:
+        parameters = signature(segmenter).parameters
+    except (TypeError, ValueError):
+        return False
+
+    if any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return True
+    return all(name in parameters for name in segmenter_kwargs)
 
 
 def _mark_all_views_failed(result: PlantAnalysisResult, message: str) -> None:
@@ -913,36 +988,57 @@ def _apply_front_trait_measurements(
 
     trait_map = result.trait_map()
     front_0_ready = bool(getattr(front_0_calibration, "is_calibrated", False))
-    front_180_ready = bool(getattr(front_180_calibration, "is_calibrated", False))
+    front_180_measurements = getattr(measurements, "front_180", None)
+    front_180_ready = front_180_measurements is not None and bool(
+        getattr(front_180_calibration, "is_calibrated", False)
+    )
 
-    if front_0_ready and front_180_ready:
+    if front_0_ready and (front_180_measurements is None or front_180_ready):
         from core.calibration import pixel_area_to_cm2, pixels_to_cm
 
-        height_cm = max(
-            pixels_to_cm(measurements.front_0.canopy_height_pixels, front_0_calibration.mm_per_pixel),
-            pixels_to_cm(measurements.front_180.canopy_height_pixels, front_180_calibration.mm_per_pixel),
-        )
-        projection_area_cm2 = (
+        heights_cm = [pixels_to_cm(measurements.front_0.canopy_height_pixels, front_0_calibration.mm_per_pixel)]
+        projection_areas_cm2 = [
             pixel_area_to_cm2(measurements.front_0.projection_area_pixels, front_0_calibration.mm_per_pixel)
-            + pixel_area_to_cm2(measurements.front_180.projection_area_pixels, front_180_calibration.mm_per_pixel)
-        ) / 2.0
+        ]
+        if front_180_measurements is not None:
+            heights_cm.append(pixels_to_cm(front_180_measurements.canopy_height_pixels, front_180_calibration.mm_per_pixel))
+            projection_areas_cm2.append(
+                pixel_area_to_cm2(front_180_measurements.projection_area_pixels, front_180_calibration.mm_per_pixel)
+            )
+
+        height_cm = max(heights_cm)
+        projection_area_cm2 = sum(projection_areas_cm2) / len(projection_areas_cm2)
 
         trait_map["canopy_height"].value = round(height_cm, 2)
         trait_map["canopy_height"].unit = "cm"
-        trait_map["canopy_height"].message = "基于 FRONT-1/FRONT-2 尺度校正后的冠层高度融合结果。"
+        trait_map["canopy_height"].message = (
+            "基于 FRONT-1 尺度校正后的冠层高度结果。"
+            if front_180_measurements is None
+            else "基于 FRONT-1/FRONT-2 尺度校正后的冠层高度融合结果。"
+        )
 
         trait_map["side_projection_area"].value = round(projection_area_cm2, 2)
         trait_map["side_projection_area"].unit = "cm^2"
-        trait_map["side_projection_area"].message = "基于 FRONT-1/FRONT-2 尺度校正后的侧视投影面积平均值。"
+        trait_map["side_projection_area"].message = (
+            "基于 FRONT-1 尺度校正后的侧视投影面积结果。"
+            if front_180_measurements is None
+            else "基于 FRONT-1/FRONT-2 尺度校正后的侧视投影面积平均值。"
+        )
     else:
         front_0_metrics = compute_front_view_traits(result.front_segmentations[VIEW_FRONT_0])
-        front_180_metrics = compute_front_view_traits(result.front_segmentations[VIEW_FRONT_180])
+        front_180_segmentation = result.front_segmentations.get(VIEW_FRONT_180)
+        front_180_metrics = (
+            compute_front_view_traits(front_180_segmentation) if front_180_segmentation is not None else None
+        )
+        pixel_message = f" FRONT-1={front_0_metrics.canopy_height_pixels}px"
+        if front_180_metrics is not None:
+            pixel_message += f", FRONT-2={front_180_metrics.canopy_height_pixels}px"
 
         trait_map["canopy_height"].value = measurements.fused_canopy_height_pixels
         trait_map["canopy_height"].unit = "px"
         trait_map["canopy_height"].message = (
             f"未完成双 FRONT 尺度校正，当前为像素高度。"
-            f" FRONT-1={front_0_metrics.canopy_height_pixels}px, FRONT-2={front_180_metrics.canopy_height_pixels}px。"
+            f"{pixel_message}。"
         )
 
         trait_map["side_projection_area"].value = round(measurements.fused_projection_area_pixels, 2)
@@ -1101,40 +1197,47 @@ def _export_front_trait_debug_artifacts(
     *,
     sample_id: str,
     front_0_image: np.ndarray,
-    front_180_image: np.ndarray,
     front_0_segmentation: Any,
-    front_180_segmentation: Any,
+    front_180_image: np.ndarray | None = None,
+    front_180_segmentation: Any | None = None,
     output_root: Path,
 ) -> dict[str, list[Path]]:
     """Save FRONT trait debug images for the current sample."""
 
     front_0_mask = front_0_segmentation.mask
-    front_180_mask = front_180_segmentation.mask
-
     front_0_debug = getattr(front_0_segmentation, "debug_images", {})
-    front_180_debug = getattr(front_180_segmentation, "debug_images", {})
-    front_segmentation_steps = (
-        _build_front_segmentation_debug_steps(
-            front_tag="front_1",
-            image=front_0_image,
-            mask=front_0_mask,
-            segmentation=front_0_segmentation,
-            debug_images=front_0_debug,
-        )
-        + _build_front_segmentation_debug_steps(
-            front_tag="front_2",
-            image=front_180_image,
-            mask=front_180_mask,
-            segmentation=front_180_segmentation,
-            debug_images=front_180_debug,
-        )
+
+    front_segmentation_steps = _build_front_segmentation_debug_steps(
+        front_tag="front_1",
+        image=front_0_image,
+        mask=front_0_mask,
+        segmentation=front_0_segmentation,
+        debug_images=front_0_debug,
     )
+
+    front_180_mask = None
+    front_180_debug: dict[str, np.ndarray] = {}
+    if front_180_image is not None and front_180_segmentation is not None:
+        front_180_mask = front_180_segmentation.mask
+        front_180_debug = getattr(front_180_segmentation, "debug_images", {})
+        front_segmentation_steps.extend(
+            _build_front_segmentation_debug_steps(
+                front_tag="front_2",
+                image=front_180_image,
+                mask=front_180_mask,
+                segmentation=front_180_segmentation,
+                debug_images=front_180_debug,
+            )
+        )
 
     canopy_height_steps = _collect_debug_steps(
         ("front_1_filtered_mask", front_0_debug.get("filtered_mask")),
         ("front_1_bounding_box", front_0_segmentation.bounding_box_image),
         ("front_2_filtered_mask", front_180_debug.get("filtered_mask")),
-        ("front_2_bounding_box", front_180_segmentation.bounding_box_image),
+        (
+            "front_2_bounding_box",
+            front_180_segmentation.bounding_box_image if front_180_segmentation is not None else None,
+        ),
     )
 
     side_projection_steps = _collect_debug_steps(
@@ -1145,10 +1248,17 @@ def _export_front_trait_debug_artifacts(
             create_gray_background_focus_image(front_0_image, front_0_mask, gray_value=96),
         ),
         ("front_2_mask", front_180_mask),
-        ("front_2_masked_region", create_masked_color_image(front_180_image, front_180_mask)),
+        (
+            "front_2_masked_region",
+            create_masked_color_image(front_180_image, front_180_mask)
+            if front_180_image is not None and front_180_mask is not None
+            else None,
+        ),
         (
             "front_2_projection_overlay",
-            create_gray_background_focus_image(front_180_image, front_180_mask, gray_value=96),
+            create_gray_background_focus_image(front_180_image, front_180_mask, gray_value=96)
+            if front_180_image is not None and front_180_mask is not None
+            else None,
         ),
     )
 
@@ -1306,9 +1416,10 @@ def _build_summary_message(result: PlantAnalysisResult) -> str:
     calibration_done = sum(
         1 for item in result.calibration_results.values() if bool(getattr(item, "is_calibrated", False))
     )
+    total_views = len(result.view_results) or len(result.calibration_results) or 3
 
     return (
-        f"分析完成。色卡校正成功 {calibration_done}/3 视角。"
+        f"分析完成。色卡校正成功 {calibration_done}/{total_views} 视角。"
         f" 叶面积={trait_map['leaf_area'].display_value} {trait_map['leaf_area'].unit},"
         f" 凸包面积={trait_map['convex_hull_area'].display_value} {trait_map['convex_hull_area'].unit},"
         f" 绿色程度={trait_map['greenness'].display_value} {trait_map['greenness'].unit},"

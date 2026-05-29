@@ -16,7 +16,6 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -92,6 +91,32 @@ class PreprocessResult:
     debug_images: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
 
+GROUP_VIEW_TO_UI_VIEW = {
+    "TOP": "TOP",
+    "1": "FRONT-1",
+    "2": "FRONT-2",
+}
+
+
+def view_paths_for_group(group: PlantImageGroup) -> dict[str, Path | None]:
+    """Return GUI view names and paths required by the group."""
+
+    all_paths = {
+        "TOP": group.top_image,
+        "FRONT-1": group.front_0_image,
+        "FRONT-2": group.front_180_image,
+    }
+    required_views = {
+        GROUP_VIEW_TO_UI_VIEW.get(view_name, view_name)
+        for view_name in group.required_views
+    }
+    return {
+        view_name: all_paths[view_name]
+        for view_name in ("TOP", "FRONT-1", "FRONT-2")
+        if view_name in required_views
+    }
+
+
 class ImagePreviewCard(QFrame):
     """Reusable card widget for file-based image preview."""
 
@@ -127,7 +152,7 @@ class ImagePreviewCard(QFrame):
 
         self.prev_nav_button = QToolButton()
         self.prev_nav_button.setObjectName("CardNavButton")
-        self.prev_nav_button.setText("‹")
+        self.prev_nav_button.setText("<")
         self.prev_nav_button.setAutoRaise(True)
         self.prev_nav_button.setCursor(Qt.PointingHandCursor)
         self.prev_nav_button.setFixedSize(24, 24)
@@ -135,7 +160,7 @@ class ImagePreviewCard(QFrame):
 
         self.next_nav_button = QToolButton()
         self.next_nav_button.setObjectName("CardNavButton")
-        self.next_nav_button.setText("›")
+        self.next_nav_button.setText(">")
         self.next_nav_button.setAutoRaise(True)
         self.next_nav_button.setCursor(Qt.PointingHandCursor)
         self.next_nav_button.setFixedSize(24, 24)
@@ -487,13 +512,9 @@ class PreprocessThread(QThread):
             result = PreprocessResult(sample_id=self.group.sample_id)
             manual_regions = self._build_manual_regions_dict()
 
-            # 1. 读取三视角图像
+            # 1. 读取当前样本所需视角图像
             self.log_message.emit(f"开始读取样本 {self.group.sample_id} 的图像...")
-            view_paths = {
-                "TOP": self.group.top_image,
-                "FRONT-1": self.group.front_0_image,
-                "FRONT-2": self.group.front_180_image,
-            }
+            view_paths = view_paths_for_group(self.group)
 
             for view_name, path in view_paths.items():
                 if path is None:
@@ -576,7 +597,8 @@ class PreprocessThread(QThread):
             )
             if calibrated_count > 0:
                 result.is_valid = True
-                result.message = f"预处理完成，{calibrated_count}/3 个视角色卡校准成功"
+                total_views = len(result.loaded_images) or len(view_paths)
+                result.message = f"预处理完成，{calibrated_count}/{total_views} 个视角色卡校准成功"
             else:
                 result.is_valid = True  # 仍允许继续，但有警告
                 result.message = "预处理完成，但所有视角均未成功检测色卡（将使用原图和默认尺度）"
@@ -628,12 +650,14 @@ class PreprocessThread(QThread):
                 continue
 
             view_key = view_name.replace("-", "_")
+            loaded = self._runtime_preview_image(loaded)
+            corrected = self._runtime_preview_image(corrected)
             steps.append((f"{view_key}_原始图像", loaded))
             steps.append((f"{view_key}_色彩增强后", corrected))
 
             # 生成原图/增强图对比图，便于快速查看校正效果
             if loaded.shape == corrected.shape:
-                before_after = np.hstack([loaded, corrected])
+                before_after = self._runtime_preview_image(np.hstack([loaded, corrected]))
                 steps.append((f"{view_key}_增强前后对比", before_after))
 
         if steps:
@@ -647,6 +671,21 @@ class PreprocessThread(QThread):
                 self.log_message.emit(f"预处理可视化结果已保存到: {saved_paths[0].parent}")
 
 
+    @staticmethod
+    def _runtime_preview_image(image: np.ndarray, *, max_side: int = 1200) -> np.ndarray:
+        """Return a bounded-size preview for routine runtime visualization output."""
+
+        if not isinstance(image, np.ndarray) or image.ndim < 2:
+            return image
+        height, width = image.shape[:2]
+        longest_side = max(height, width)
+        if longest_side <= max_side or cv2 is None:
+            return image.copy()
+        scale = max_side / float(longest_side)
+        target_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+
+
 class StrawberryMainWindow(QMainWindow):
     """Main GUI window for grouped sample analysis."""
 
@@ -658,6 +697,7 @@ class StrawberryMainWindow(QMainWindow):
         self.current_result: PlantAnalysisResult | None = None
         self.displayed_result: PlantAnalysisResult | None = None
         self.current_batch_report: BatchAnalysisReport | None = None
+        self._analysis_results_by_sample: dict[str, PlantAnalysisResult] = {}
         self.analysis_thread: AnalysisThread | None = None
         
         # 色卡区域选择状态
@@ -690,7 +730,7 @@ class StrawberryMainWindow(QMainWindow):
     def _try_load_color_card_regions(self) -> None:
         """Try to load previously saved color card regions."""
         regions = load_color_card_regions(self.color_card_config_path)
-        if regions and regions.is_complete():
+        if regions and (regions.top is not None or regions.front_1 is not None):
             self.color_card_regions = regions
             self._update_color_card_status()
             self._append_log("已加载先前保存的色卡区域配置。")
@@ -842,14 +882,14 @@ class StrawberryMainWindow(QMainWindow):
         switcher_layout.setSpacing(8)
         self.preview_view_prev_button = QToolButton()
         self.preview_view_prev_button.setObjectName("PreviewNavButton")
-        self.preview_view_prev_button.setText("‹")
+        self.preview_view_prev_button.setText("<")
         self.preview_view_prev_button.clicked.connect(self._show_previous_preview_view)
         self.preview_view_name_label = QLabel("TOP")
         self.preview_view_name_label.setObjectName("PreviewViewChip")
         self.preview_view_name_label.setAlignment(Qt.AlignCenter)
         self.preview_view_next_button = QToolButton()
         self.preview_view_next_button.setObjectName("PreviewNavButton")
-        self.preview_view_next_button.setText("›")
+        self.preview_view_next_button.setText(">")
         self.preview_view_next_button.clicked.connect(self._show_next_preview_view)
         self.preview_view_index_label = QLabel("1 / 1")
         self.preview_view_index_label.setObjectName("PreviewPageLabel")
@@ -943,44 +983,8 @@ class StrawberryMainWindow(QMainWindow):
         self.cc_front0_preview = None
         self.cc_front180_preview = None
 
-        meta_group = QGroupBox("当前样本信息")
-        meta_layout = QFormLayout(meta_group)
-        self.sample_id_value = QLabel("--")
-        self.completeness_value = QLabel("--")
-        self.missing_views_value = QLabel("--")
-        self.analysis_status_value = QLabel("--")
-        self.analysis_message_value = QLabel("--")
-        self.segmentation_summary_value = QLabel("--")
-        self.debug_output_value = QLabel("--")
-        self.top_path_value = QLabel("--")
-        self.front0_path_value = QLabel("--")
-        self.front180_path_value = QLabel("--")
-
-        for label in (
-            self.analysis_message_value,
-            self.segmentation_summary_value,
-            self.debug_output_value,
-            self.top_path_value,
-            self.front0_path_value,
-            self.front180_path_value,
-        ):
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        meta_layout.addRow("样本编号", self.sample_id_value)
-        meta_layout.addRow("视角完整性", self.completeness_value)
-        meta_layout.addRow("缺失视角", self.missing_views_value)
-        meta_layout.addRow("分析状态", self.analysis_status_value)
-        meta_layout.addRow("分析说明", self.analysis_message_value)
-        meta_layout.addRow("TOP 分割摘要", self.segmentation_summary_value)
-        meta_layout.addRow("调试输出目录", self.debug_output_value)
-        meta_layout.addRow("TOP", self.top_path_value)
-        meta_layout.addRow("FRONT-1", self.front0_path_value)
-        meta_layout.addRow("FRONT-2", self.front180_path_value)
-
         layout.addWidget(self.preview_group)
         layout.addWidget(self.batch_pager_widget)
-        layout.addWidget(meta_group)
         scroll_area.setWidget(content)
         self._refresh_preview_header()
         return scroll_area
@@ -1024,7 +1028,7 @@ class StrawberryMainWindow(QMainWindow):
         # 色卡选择按钮
         self.select_color_card_btn = QPushButton("选择色卡区域")
         self.select_color_card_btn.setToolTip(
-            "手动框选三个视角图像中的色卡区域。\n"
+            "手动框选当前样本所需视角图像中的色卡区域。\n"
             "用于后续色卡定位、颜色校正和基于色块的尺度标定。"
         )
         self.select_color_card_btn.clicked.connect(self._handle_select_color_card_regions)
@@ -1401,7 +1405,7 @@ class StrawberryMainWindow(QMainWindow):
         pass
 
     def _handle_select_color_card_regions(self) -> None:
-        """打开色卡区域选择对话框，让用户手动框选三个视角的色卡位置。"""
+        """打开色卡区域选择对话框，让用户手动框选所需视角的色卡位置。"""
         group = self._selected_group()
         if group is None:
             QMessageBox.information(self, "提示", "请先在左侧列表中选择一个样本组，再选择色卡区域。")
@@ -1417,16 +1421,27 @@ class StrawberryMainWindow(QMainWindow):
             return
 
         import cv2 as cv
-        
-        # 加载三个视角的图像
+
         try:
-            top_image = cv.imread(str(group.top_image))
-            front_1_image = cv.imread(str(group.front_0_image))
-            front_2_image = cv.imread(str(group.front_180_image))
-            
-            if top_image is None or front_1_image is None or front_2_image is None:
-                QMessageBox.warning(self, "图像加载失败", "无法加载一个或多个视角图像，请检查文件是否存在。")
-                return
+            loaded_images: dict[str, np.ndarray | None] = {
+                "TOP": None,
+                "FRONT-1": None,
+                "FRONT-2": None,
+            }
+            for view_name, path in view_paths_for_group(group).items():
+                if path is None:
+                    QMessageBox.warning(self, "图像加载失败", f"{view_name} 图像缺失")
+                    return
+
+                image = cv.imread(str(path))
+                if image is None:
+                    QMessageBox.warning(self, "图像加载失败", f"无法加载 {view_name} 图像: {path}")
+                    return
+                loaded_images[view_name] = image
+
+            top_image = loaded_images["TOP"]
+            front_1_image = loaded_images["FRONT-1"]
+            front_2_image = loaded_images["FRONT-2"]
         except Exception as e:
             QMessageBox.warning(self, "图像加载失败", f"加载图像时发生错误: {e}")
             return
@@ -1510,6 +1525,7 @@ class StrawberryMainWindow(QMainWindow):
         self.current_batch_report = None
         self.current_result = None
         self.displayed_result = None
+        self._analysis_results_by_sample.clear()
         self.data_dir_label.setText(str(directory))
 
         incomplete_count = len(find_incomplete_groups(self.groups))
@@ -1574,24 +1590,12 @@ class StrawberryMainWindow(QMainWindow):
             return
 
         group = self.groups[row]
-        self.current_result = None
-        self.displayed_result = None
-        self.current_batch_report = None
+        self.current_result = self._analysis_result_for_sample(group.sample_id)
+        self.displayed_result = self.current_result
         self._update_group_view(group)
         self._append_log(f"切换到样本组: {group.sample_id}")
 
     def _update_group_view(self, group: PlantImageGroup) -> None:
-        self.sample_id_value.setText(group.sample_id)
-        self.completeness_value.setText("完整" if group.is_complete else "不完整")
-        self.missing_views_value.setText(", ".join(group.missing_views) if group.missing_views else "无")
-        self.analysis_status_value.setText("未分析")
-        self.analysis_message_value.setText("尚未执行分析。")
-        self.segmentation_summary_value.setText("--")
-        self.debug_output_value.setText("--")
-        self.top_path_value.setText(str(group.top_image) if group.top_image else "--")
-        self.front0_path_value.setText(str(group.front_0_image) if group.front_0_image else "--")
-        self.front180_path_value.setText(str(group.front_180_image) if group.front_180_image else "--")
-
         if self.preview_mode == "phenotype" and self._has_previewable_phenotype_result(group.sample_id):
             self._show_trait_preview_for_sample(group.sample_id)
         elif self.preview_mode == "preprocess" and self.preprocess_result is not None and self.preprocess_result.sample_id == group.sample_id:
@@ -1608,16 +1612,6 @@ class StrawberryMainWindow(QMainWindow):
         self.current_result = None
         self.displayed_result = None
         self.current_batch_report = None
-        self.sample_id_value.setText("--")
-        self.completeness_value.setText("--")
-        self.missing_views_value.setText("--")
-        self.analysis_status_value.setText("--")
-        self.analysis_message_value.setText("--")
-        self.segmentation_summary_value.setText("--")
-        self.debug_output_value.setText("--")
-        self.top_path_value.setText("--")
-        self.front0_path_value.setText("--")
-        self.front180_path_value.setText("--")
         self._set_preview_state(sample_id=None, mode="original")
         self._render_current_preview()
         self._set_batch_pager_visible(False)
@@ -1644,7 +1638,7 @@ class StrawberryMainWindow(QMainWindow):
         if self.color_card_regions is None:
             QMessageBox.warning(
                 self, "未选择色卡区域",
-                '请先点击"选择色卡区域"按钮框选三个视角的色卡位置。'
+                '请先点击"选择色卡区域"按钮框选当前样本所需视角的色卡位置。'
             )
             return
 
@@ -1687,8 +1681,9 @@ class StrawberryMainWindow(QMainWindow):
                 1 for cal in result.calibration_results.values()
                 if getattr(cal, "is_calibrated", False)
             )
+            total_views = len(result.loaded_images) or len(result.calibration_results) or 3
             self.color_card_status_label.setText(
-                f"状态: 预处理完成 ({calibrated_count}/3 视角校准成功)"
+                f"状态: 预处理完成 ({calibrated_count}/{total_views} 视角校准成功)"
             )
             self.color_card_status_label.setStyleSheet("color: #2d8a4e; font-size: 12px;")
             self._show_preprocess_preview(result)
@@ -1721,7 +1716,7 @@ class StrawberryMainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "未完成预处理",
                 '请先完成预处理步骤：\n\n'
-                '1. 点击"选择色卡区域"框选三个视角的色卡\n'
+                '1. 点击"选择色卡区域"框选当前样本所需视角的色卡\n'
                 '2. 点击"预处理"进行色卡定位和颜色校正'
             )
             return
@@ -1764,6 +1759,7 @@ class StrawberryMainWindow(QMainWindow):
         """Apply the single-sample analysis result on the UI thread."""
 
         self.current_result = result
+        self._cache_analysis_result(result)
         self._apply_analysis_result(result)
 
         if result.status in {"load_failed", "incomplete_input", "dependency_error", "segmentation_failed"}:
@@ -1796,23 +1792,8 @@ class StrawberryMainWindow(QMainWindow):
             self._append_log(f"自动保存失败: {error}", level="ERROR")
 
     def _apply_analysis_result(self, result: PlantAnalysisResult) -> None:
-        self.analysis_status_value.setText(format_status_label(result.status))
-        self.analysis_message_value.setText(result.message)
         self._set_displayed_result(result)
         self._apply_debug_previews(build_analysis_debug_previews(result))
-
-        artifact_paths = next((paths for paths in result.debug_artifact_paths.values() if paths), None)
-        self.debug_output_value.setText(str(artifact_paths[0].parent.parent) if artifact_paths else "--")
-
-        top_segmentation = result.top_segmentation
-        if top_segmentation is None:
-            self.segmentation_summary_value.setText("--")
-        else:
-            self.segmentation_summary_value.setText(
-                f"mask_area={top_segmentation.mask_area_pixels}, "
-                f"contours={top_segmentation.contour_count}, "
-                f"hull_area={top_segmentation.hull_area_pixels:.1f}"
-            )
 
         for view_name, view_result in result.view_results.items():
             if view_result.shape is not None:
@@ -1833,7 +1814,7 @@ class StrawberryMainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "未完成预处理",
                 '请先完成色卡预处理步骤：\n\n'
-                '1. 点击"选择色卡区域"框选三个视角的色卡\n'
+                '1. 点击"选择色卡区域"框选当前样本所需视角的色卡\n'
                 '2. 点击"预处理"进行颜色校正和尺度标定'
             )
             return
@@ -1870,6 +1851,8 @@ class StrawberryMainWindow(QMainWindow):
         """Apply the batch analysis summary on the UI thread."""
 
         self.current_batch_report = report
+        for item in report.sample_results:
+            self._cache_analysis_result(item.result)
         summary_message = (
             f"批量处理完成。总样本 {report.total_groups} 组，"
             f"成功 {report.completed_groups} 组，"
@@ -2265,7 +2248,15 @@ class StrawberryMainWindow(QMainWindow):
             for item in self.current_batch_report.sample_results:
                 if item.group.sample_id == sample_id:
                     return item.result
+        cached_result = self._analysis_results_by_sample.get(sample_id)
+        if cached_result is not None:
+            return cached_result
         return None
+
+    def _cache_analysis_result(self, result: PlantAnalysisResult) -> None:
+        """Keep phenotype previews available after switching between samples."""
+
+        self._analysis_results_by_sample[result.sample_id] = result
 
     def _build_in_memory_phenotype_stage_payloads(
         self,
@@ -2650,16 +2641,7 @@ class StrawberryMainWindow(QMainWindow):
     def _sync_displayed_result_for_sample(self, sample_id: str) -> None:
         """Update the measurement table to match the sample shown in the center panel."""
 
-        matched_result: PlantAnalysisResult | None = None
-        if self.current_batch_report is not None:
-            for item in self.current_batch_report.sample_results:
-                if item.group.sample_id == sample_id:
-                    matched_result = item.result
-                    break
-        elif self.current_result is not None and self.current_result.sample_id == sample_id:
-            matched_result = self.current_result
-
-        self._set_displayed_result(matched_result)
+        self._set_displayed_result(self._analysis_result_for_sample(sample_id))
 
     def _update_batch_page_label(self) -> None:
         if not self.batch_preview_sample_ids:

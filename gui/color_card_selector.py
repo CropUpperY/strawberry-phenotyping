@@ -37,7 +37,7 @@ class ColorCardRegion(NamedTuple):
 
 
 class ColorCardRegions(NamedTuple):
-    """Color card regions for all three views."""
+    """Color card regions for available plant views."""
     top: ColorCardRegion | None
     front_1: ColorCardRegion | None
     front_2: ColorCardRegion | None
@@ -335,60 +335,44 @@ def select_color_card_regions_interactive(
     existing_regions: ColorCardRegions | None = None,
     parent: QWidget | None = None,
 ) -> ColorCardRegions | None:
-    """
-    Show sequential dialogs to select color card regions for all three views.
-    
-    Returns:
-        ColorCardRegions if all three views were successfully selected, None if cancelled.
-    """
-    views = [
-        ("TOP 俯视图", top_image, "步骤 1/3：选择 TOP 俯视图中的色卡"),
-        ("FRONT-1 正视图", front_1_image, "步骤 2/3：选择 FRONT-1 正视图中的色卡"),
-        ("FRONT-2 正视图", front_2_image, "步骤 3/3：选择 FRONT-2 正视图中的色卡"),
+    """Show sequential dialogs to select color-card regions for available views."""
+
+    candidates = [
+        ("top", "TOP", top_image, existing_regions.top if existing_regions else None),
+        ("front_1", "FRONT-1", front_1_image, existing_regions.front_1 if existing_regions else None),
+        ("front_2", "FRONT-2", front_2_image, existing_regions.front_2 if existing_regions else None),
     ]
-    
-    existing = [
-        existing_regions.top if existing_regions else None,
-        existing_regions.front_1 if existing_regions else None,
-        existing_regions.front_2 if existing_regions else None,
+    available_views = [
+        (key, view_name, image, existing_region)
+        for key, view_name, image, existing_region in candidates
+        if image is not None
     ]
-    
-    results: list[ColorCardRegion | None] = []
-    
-    for i, (view_name, image, step_info) in enumerate(views):
-        if image is None:
-            QMessageBox.warning(
-                parent,
-                "缺少图像",
-                f"{view_name} 图像缺失，无法进行色卡区域选择。\n请确保已加载包含完整三视角图像的样本组。"
-            )
-            return None
-        
+    if not available_views:
+        QMessageBox.warning(parent, "缺少图像", "没有可用的视角图像，无法选择色卡区域。")
+        return None
+
+    results: dict[str, ColorCardRegion | None] = {"top": None, "front_1": None, "front_2": None}
+    total_views = len(available_views)
+    for index, (key, view_name, image, existing_region) in enumerate(available_views, start=1):
         dialog = SingleViewSelectorDialog(
             view_name=view_name,
             image=image,
-            step_info=step_info,
-            existing_region=existing[i],
+            step_info=f"Step {index}/{total_views}: select the color card in {view_name}",
+            existing_region=existing_region,
             parent=parent,
         )
-        
+
         if dialog.exec_() != QDialog.Accepted:
             return None
-        
         if dialog.selected_region is None:
-            QMessageBox.warning(
-                parent,
-                "未选择区域",
-                f"未选择 {view_name} 的色卡区域。请重新操作。"
-            )
+            QMessageBox.warning(parent, "未选择区域", f"未选择 {view_name} 的色卡区域，请重新操作。")
             return None
-        
-        results.append(dialog.selected_region)
-    
+        results[key] = dialog.selected_region
+
     return ColorCardRegions(
-        top=results[0],
-        front_1=results[1],
-        front_2=results[2],
+        top=results["top"],
+        front_1=results["front_1"],
+        front_2=results["front_2"],
     )
 
 

@@ -33,7 +33,7 @@ class FrontTraitMeasurements:
     """Fused FRONT-view phenotype measurements."""
 
     front_0: FrontViewMeasurements
-    front_180: FrontViewMeasurements
+    front_180: FrontViewMeasurements | None
     fused_canopy_height_pixels: int
     fused_canopy_width_pixels: int
     fused_projection_area_pixels: float
@@ -118,19 +118,18 @@ def compute_front_view_traits(front_segmentation: Any) -> FrontViewMeasurements:
     )
 
 
-def fuse_front_traits(front_0_segmentation: Any, front_180_segmentation: Any) -> FrontTraitMeasurements:
-    """Fuse FRONT-1 and FRONT-2 measurements to reduce occlusion bias."""
+def fuse_front_traits(front_0_segmentation: Any, front_180_segmentation: Any | None = None) -> FrontTraitMeasurements:
+    """Fuse one or two FRONT measurements to reduce occlusion bias when possible."""
 
     front_0 = compute_front_view_traits(front_0_segmentation)
-    front_180 = compute_front_view_traits(front_180_segmentation)
+    front_180 = compute_front_view_traits(front_180_segmentation) if front_180_segmentation is not None else None
+    front_measurements = [front_0] if front_180 is None else [front_0, front_180]
 
     return FrontTraitMeasurements(
         front_0=front_0,
         front_180=front_180,
-        fused_canopy_height_pixels=max(front_0.canopy_height_pixels, front_180.canopy_height_pixels),
-        fused_canopy_width_pixels=max(front_0.canopy_width_pixels, front_180.canopy_width_pixels),
-        fused_projection_area_pixels=(
-            front_0.projection_area_pixels + front_180.projection_area_pixels
-        )
-        / 2.0,
+        fused_canopy_height_pixels=max(item.canopy_height_pixels for item in front_measurements),
+        fused_canopy_width_pixels=max(item.canopy_width_pixels for item in front_measurements),
+        fused_projection_area_pixels=sum(item.projection_area_pixels for item in front_measurements)
+        / len(front_measurements),
     )

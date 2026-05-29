@@ -62,6 +62,30 @@ def test_group_image_files_reports_missing_views(tmp_path: Path) -> None:
     assert incomplete_groups[0].missing_views == [VIEW_FRONT_180]
 
 
+def test_group_image_files_collects_two_view_cotton_folder_layout(tmp_path: Path) -> None:
+    """Cotton folders should group matching top/front filenames and ignore overview images."""
+
+    top_dir = tmp_path / "\u4fef\u89c6\u56fe"
+    front_dir = tmp_path / "\u5e73\u89c6\u56fe"
+    overview_dir = tmp_path / "\u603b\u56fe"
+    top_dir.mkdir()
+    front_dir.mkdir()
+    overview_dir.mkdir()
+
+    for filename in ("\u4e2d425-1.jpg", "\u65b0\u9646\u65e9-2.jpg"):
+        (top_dir / filename).write_bytes(b"test")
+        (front_dir / filename).write_bytes(b"test")
+    (overview_dir / "\u4e2d425.jpg").write_bytes(b"test")
+
+    groups = group_image_files(tmp_path)
+
+    assert [group.sample_id for group in groups] == ["\u4e2d425-1", "\u65b0\u9646\u65e9-2"]
+    assert all(group.is_complete for group in groups)
+    assert all(group.missing_views == [] for group in groups)
+    assert all(group.front_180_image is None for group in groups)
+    assert [group.required_views for group in groups] == [(VIEW_TOP, VIEW_FRONT_0), (VIEW_TOP, VIEW_FRONT_0)]
+
+
 def test_group_image_files_handles_duplicate_views_as_extras(tmp_path: Path) -> None:
     """Later duplicate view files should not overwrite the first matched image."""
     for filename in ("3AB_TOP.png", "3AB-1.jpg", "3AB-1.png", "3AB-2.png"):

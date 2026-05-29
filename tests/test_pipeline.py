@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from core.grouping import PlantImageGroup
+from core.grouping import PlantImageGroup, VIEW_FRONT_0, VIEW_TOP
 from core.pipeline import _build_top_organ_filter_mask, analyze_plant_group, create_result_rows
 
 
@@ -166,6 +166,76 @@ def test_analyze_plant_group_computes_calibrated_traits() -> None:
     assert trait_map["canopy_width"].value == 0.28
     assert trait_map["side_projection_area"].unit == "cm^2"
     assert trait_map["side_projection_area"].value == 1.0
+
+
+def test_analyze_plant_group_computes_traits_for_two_view_cotton_group() -> None:
+    """A complete two-view cotton group should not require FRONT-2 analysis."""
+
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=Path("data/cotton/top/cotton-1.jpg"),
+        front_0_image=Path("data/cotton/front/cotton-1.jpg"),
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+
+    image = np.zeros((32, 48, 3), dtype=np.uint8)
+    image[:, :, 1] = 120
+
+    def calibrator(payload: np.ndarray, *, view_name: str) -> SimpleNamespace:
+        return _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2)
+
+    result = analyze_plant_group(
+        group,
+        emit_log=lambda _: None,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: FakeFrontSegmentationResult(height=90, width=45, mask_area=2400),
+        image_calibrator=calibrator,
+        debug_output_dir=None,
+    )
+
+    trait_map = result.trait_map()
+
+    assert result.status == "analysis_complete"
+    assert "FRONT-2" not in result.view_results
+    assert result.front_segmentations.keys() == {"FRONT-1"}
+    assert trait_map["canopy_height"].value == 1.8
+    assert trait_map["side_projection_area"].value == 0.96
+
+
+def test_analyze_plant_group_uses_cotton_top_profile_for_two_view_group() -> None:
+    """Cotton two-view groups should opt into the TOP cotton segmentation profile."""
+
+    group = PlantImageGroup(
+        sample_id="cotton-1",
+        top_image=Path("data/cotton/top/cotton-1.jpg"),
+        front_0_image=Path("data/cotton/front/cotton-1.jpg"),
+        front_180_image=None,
+        required_views=(VIEW_TOP, VIEW_FRONT_0),
+    )
+    image = np.zeros((32, 48, 3), dtype=np.uint8)
+    image[:, :, 1] = 120
+    received_profiles: list[str] = []
+
+    def top_segmenter(payload: np.ndarray, *, profile: str = "default") -> FakeTopSegmentationResult:
+        received_profiles.append(profile)
+        return FakeTopSegmentationResult(height=payload.shape[0], width=payload.shape[1])
+
+    def calibrator(payload: np.ndarray, *, view_name: str) -> SimpleNamespace:
+        return _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2)
+
+    result = analyze_plant_group(
+        group,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=top_segmenter,
+        front_segmenter=lambda _: FakeFrontSegmentationResult(height=90, width=45, mask_area=2400),
+        image_calibrator=calibrator,
+        debug_output_dir=None,
+    )
+
+    assert result.status == "analysis_complete"
+    assert received_profiles == ["cotton"]
 
 
 def test_analyze_plant_group_falls_back_to_pixel_units_when_calibration_missing() -> None:
@@ -355,6 +425,42 @@ def test_analyze_plant_group_populates_flower_and_fruit_counts() -> None:
     assert trait_map["fruit_count"].status == "computed"
     assert trait_map["flower_bud_count"].value is None
     assert trait_map["flower_bud_count"].status == "pending_algorithm"
+
+
+def test_analyze_plant_group_logs_stage_timings() -> None:
+    """Long-running segmentation and organ-detection stages should report elapsed time."""
+
+    group = PlantImageGroup(
+        sample_id="1AB",
+        top_image=Path("data/1AB_TOP.png"),
+        front_0_image=Path("data/1AB-1.png"),
+        front_180_image=Path("data/1AB-2.png"),
+    )
+    image = np.full((24, 24, 3), (20, 140, 20), dtype=np.uint8)
+    front_results = iter(
+        [
+            FakeFrontSegmentationResult(height=40, width=20, mask_area=500),
+            FakeFrontSegmentationResult(height=45, width=22, mask_area=550),
+        ]
+    )
+    logs: list[str] = []
+
+    analyze_plant_group(
+        group,
+        emit_log=logs.append,
+        image_loader=lambda _: image.copy(),
+        top_segmenter=lambda _: FakeTopSegmentationResult(height=image.shape[0], width=image.shape[1]),
+        front_segmenter=lambda _: next(front_results),
+        image_calibrator=lambda payload, *, view_name: _build_fake_calibration(payload, view_name=view_name, mm_per_pixel=0.2),
+        top_flower_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(3, top_image.shape[0], top_image.shape[1]),
+        top_fruit_detector=lambda top_image, canopy_mask: FakeOrganDetectionResult(2, top_image.shape[0], top_image.shape[1]),
+        debug_output_dir=None,
+    )
+
+    assert any("TOP 分割完成，用时" in message for message in logs)
+    assert any("FRONT-1 分割完成，用时" in message for message in logs)
+    assert any("TOP 花朵检测完成，用时" in message for message in logs)
+    assert any("TOP 果实检测完成，用时" in message for message in logs)
 
 
 def test_analyze_plant_group_computes_fruit_area_and_source_sink_ratio() -> None:

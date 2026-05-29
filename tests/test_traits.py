@@ -121,3 +121,14 @@ def test_fuse_front_traits_combines_two_views() -> None:
     assert measurements.fused_canopy_height_pixels == 88
     assert measurements.fused_canopy_width_pixels == 52
     assert measurements.fused_projection_area_pixels == 2400.0
+
+
+def test_fuse_front_traits_accepts_one_view() -> None:
+    """A single FRONT view should produce usable side-view measurements."""
+
+    measurements = fuse_front_traits(DummyFrontSegmentation(width=45, height=90, area=2300))
+
+    assert measurements.front_180 is None
+    assert measurements.fused_canopy_height_pixels == 90
+    assert measurements.fused_canopy_width_pixels == 45
+    assert measurements.fused_projection_area_pixels == 2300.0
