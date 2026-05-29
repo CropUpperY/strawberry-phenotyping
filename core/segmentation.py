@@ -120,7 +120,8 @@ def segment_top_view_plant(
     convex_hull = cv2.convexHull(all_points)
     contour_image = image.copy()
     hull_image = image.copy()
-    cv2.drawContours(contour_image, contours, -1, (0, 0, 255), 3)
+    display_contours = _smooth_cotton_top_display_contours(contours) if profile == "cotton" else contours
+    cv2.drawContours(contour_image, display_contours, -1, (0, 0, 255), 3)
     cv2.polylines(hull_image, [convex_hull], True, (255, 255, 0), 4)
 
     prepared["contour_overlay"] = contour_image
@@ -785,7 +786,7 @@ def _close_cotton_top_leaf_edge_gaps(mask: np.ndarray) -> np.ndarray:
         return mask
 
     image_height, image_width = mask.shape
-    kernel_size = _make_odd(max(5, int(round(min(image_height, image_width) * 0.012))))
+    kernel_size = _make_odd(max(5, int(round(min(image_height, image_width) * 0.001))))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return _filter_cotton_top_components(closed)[0]
@@ -1191,6 +1192,37 @@ def _fill_small_holes(mask: np.ndarray) -> np.ndarray:
         filled_mask[labels == component_index] = 255
 
     return filled_mask
+
+
+def _smooth_cotton_top_display_contours(contours: list[np.ndarray]) -> list[np.ndarray]:
+    """Return visually smoother cotton TOP contours for overlay drawing only."""
+
+    smoothed_contours: list[np.ndarray] = []
+    for contour in contours:
+        if contour is None or len(contour) < 4:
+            smoothed_contours.append(contour)
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = max(1.0, perimeter * 0.009)
+        simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2).astype(np.float32)
+        if len(simplified) < 4:
+            smoothed_contours.append(contour)
+            continue
+
+        points = simplified
+        for _ in range(2):
+            next_points = np.roll(points, -1, axis=0)
+            q_points = points * 0.75 + next_points * 0.25
+            r_points = points * 0.25 + next_points * 0.75
+            points = np.empty((len(points) * 2, 2), dtype=np.float32)
+            points[0::2] = q_points
+            points[1::2] = r_points
+
+        smoothed = np.round(points).astype(np.int32).reshape(-1, 1, 2)
+        smoothed_contours.append(smoothed)
+
+    return smoothed_contours
 
 
 def _find_external_contours(mask: np.ndarray) -> list[np.ndarray]:
